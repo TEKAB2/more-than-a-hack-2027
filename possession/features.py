@@ -117,7 +117,56 @@ def compute(atd, blocks, pitch, max_interp=12, near_radius=3.0):
     f["shape_adv"] = ((cx_home - length / 2) * sign - (cx_away - length / 2) * (-sign)) \
         .astype(np.float32)
     f["n_players"] = (~np.isnan(players[:, :, 0])).sum(axis=1).astype(np.int8)
+
+    control_features(f, players, team, blocks, dist)
     return f
+
+
+def _velocity(xy, k=3):
+    """Centred velocity (m/s) over +/-k frames. xy (n, ..., 2) -> (n, ..., 2), NaN at the edges."""
+    v = np.full(xy.shape, np.nan, dtype=np.float32)
+    v[k:-k] = (xy[2 * k:] - xy[:-2 * k]) * (FPS / (2.0 * k))
+    return v
+
+
+def control_features(f, players, team, blocks, dist):
+    """Who is *controlling* the ball, not just who is nearest to it.
+
+    A player controls the ball when it is at his feet (< 1.5 m) and travels with him (relative
+    speed < 2.5 m/s). During a pass or a deflection the nearest player is not controlling it, which
+    is exactly what the challenge's possession rule asks for and what nearest-player gets wrong:
+    the evidence for the receiving team must start at the reception, not while the ball flies
+    towards him.
+
+    Also flags a *stationary free ball* (seen, not moving for ~1 s, nobody on it): the ball placed
+    for a free kick, a corner, a goal kick -- a strong sign the ball is dead.
+    """
+    n = len(f["ball_seen"])
+    f["control"] = np.zeros(n, dtype=np.int8)        # +1 home controls, -1 away, 0 nobody
+    f["stationary"] = np.zeros(n, dtype=bool)
+    f["ball_disp"] = np.full(n, np.nan, dtype=np.float32)  # metres moved over the last 0.4 s
+    nearest = np.argmin(dist, axis=1)
+    dmin = dist[np.arange(n), nearest]
+    for _, lo, hi in blocks:
+        sl = slice(lo, hi + 1)
+        b = f["ball"][sl]
+        vb = _velocity(b)
+        p = players[sl, :, :2]
+        idx = nearest[sl]
+        vp = _velocity(p)[np.arange(hi + 1 - lo), idx]
+        rel = np.hypot(vb[:, 0] - vp[:, 0], vb[:, 1] - vp[:, 1])
+        seen = f["ball_seen"][sl]
+        with np.errstate(invalid="ignore"):
+            ctrl = seen & (dmin[sl] < 1.5) & (np.nan_to_num(rel, nan=99) < 2.5)
+        sign = np.where(team[idx] == 0, 1, -1).astype(np.int8)
+        f["control"][sl] = np.where(ctrl, sign, 0)
+
+        disp = np.full(len(b), np.nan, dtype=np.float32)
+        disp[10:] = np.hypot(b[10:, 0] - b[:-10, 0], b[10:, 1] - b[:-10, 1])
+        f["ball_disp"][sl] = disp
+        still = seen & (np.nan_to_num(_moving_mean(disp, FPS // 2), nan=9) < 0.3)
+        with np.errstate(invalid="ignore"):
+            f["stationary"][sl] = still & (dmin[sl] > 0.8)
 
 
 class _null:

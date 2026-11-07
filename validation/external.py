@@ -163,6 +163,41 @@ def _scale(players, ball):
     return players, ball
 
 
+def load_idsse(path):
+    """One open Bundesliga match saved by validation.fetch_idsse. Labels straight from the DFL
+    corrected tracking (BallStatus, BallPossession) -- the same kind of source as the challenge's
+    ground truth. Returns (players, ball), team, blocks, labels, pseudo-events."""
+    z = np.load(path)
+    players = np.concatenate([z["players"], np.full(z["players"].shape[:2] + (1,), np.nan,
+                                                    dtype=np.float32)], axis=2)
+    ball, alive, owner, period = z["ball"], z["alive"], z["owner"], z["period"]
+    n = len(ball)
+    blocks = []
+    for p in sorted(set(period.tolist()) - {0}):
+        idx = np.flatnonzero(period == p)
+        blocks.append((int(p), int(idx[0]), int(idx[-1])))
+    labels = np.full(n, "X", dtype="<U1")
+    for _, lo, hi in blocks:
+        last = "D"
+        for t in range(lo, hi + 1):
+            if not alive[t]:
+                labels[t] = "D"
+                continue
+            if owner[t] >= 0:
+                last = "H" if owner[t] == 0 else "A"
+            elif last == "D":
+                last = "H"  # unknown owner right after a restart: rare, filled below
+            labels[t] = last
+    # pseudo-events: one restart per dead->alive transition, for fake_set_piece_tags()
+    events = []
+    for _, lo, hi in blocks:
+        seg = labels[lo:hi + 1]
+        for i in np.flatnonzero((seg[1:] != "D") & (seg[:-1] == "D")) + 1:
+            events.append({"team": 0 if seg[i] == "H" else 1, "type": "SET PIECE",
+                           "subtype": "RESTART", "start": lo + int(i), "end": lo + int(i)})
+    return (players, ball.astype(np.float32)), z["team"].astype(np.int8), blocks, labels, events
+
+
 # ------------------------------------------------------------------------------------ labels
 def labels_from_events(events, n_frames, blocks):
     labels = np.full(n_frames, "X", dtype="<U1")
@@ -283,6 +318,14 @@ def speeds(players):
 
 
 def fake_set_piece_tags(events, rng, miss=0.15, jitter=1.0):
+    """See below. Pseudo-restarts of the Bundesliga games are dropped more often (55 %): the
+    Smart Tagging of BAR-ATH tags 59 set pieces for well over 100 stoppages."""
+    if events and events[0].get("subtype") == "RESTART":
+        miss = 0.55
+    return _fake_tags(events, rng, miss, jitter)
+
+
+def _fake_tags(events, rng, miss, jitter):
     """Automatic-tagging stand-in: set pieces, jittered, some dropped, throw-ins with no team."""
     pieces = []
     for e in events:
@@ -298,11 +341,22 @@ def fake_set_piece_tags(events, rng, miss=0.15, jitter=1.0):
 
 
 # ----------------------------------------------------------------------------------- running
-def prepare(samples_dir, seed=0):
-    """[(name, atd_dict, blocks, labels, events)] for the three sample games, degraded."""
+IDSSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "external_data")
+
+
+def prepare(samples_dir, seed=0, idsse_dir=IDSSE_DIR):
+    """[(name, atd_dict, blocks, labels, events)] for the sample games (+ the open Bundesliga
+    matches when validation/external_data holds them), degraded like the ATD."""
     rng = np.random.default_rng(seed)
     data_dir = os.path.join(samples_dir, "data")
     games = []
+    extra = []
+    if idsse_dir and os.path.isdir(idsse_dir):
+        for name in sorted(os.listdir(idsse_dir)):
+            if name.startswith("idsse_") and name.endswith(".npz"):
+                (players, ball), team, blocks, labels, events = load_idsse(
+                    os.path.join(idsse_dir, name))
+                extra.append((name[:-4], players, ball, team, blocks, events, labels))
     for n in (1, 2):
         (players, ball), team, blocks, events = load_csv_game(
             os.path.join(data_dir, "Sample_Game_{}".format(n)), n)
@@ -310,9 +364,11 @@ def prepare(samples_dir, seed=0):
     (players, ball), team, blocks, events = load_epts_game(os.path.join(data_dir, "Sample_Game_3"))
     games.append(("sample3", players, ball, team, blocks, events))
 
+    games = [g + (None,) for g in games] + extra
     out = []
-    for name, players, ball, team, blocks, events in games:
-        labels = labels_from_events(events, len(ball), blocks)
+    for name, players, ball, team, blocks, events, labels in games:
+        if labels is None:
+            labels = labels_from_events(events, len(ball), blocks)
         mark_openings(events, blocks)
         players, ball = degrade(players, ball, rng)
         atd = {"players": speeds(players), "ball": ball, "team": team}

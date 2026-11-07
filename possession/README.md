@@ -1,4 +1,4 @@
-# `possession/` — frame-level ball possession, v2
+# `possession/` — frame-level ball possession, v3
 
 State-model pipeline for More than a Hack 2027, Phase 1. Drop this folder (and `tests/`) into a
 fork of the official repository; it imports `games.py` from the repo root.
@@ -38,7 +38,8 @@ provided game is used.
 |---|---|
 | official baseline, ±2 s window | ≈ 0.25 |
 | v1 (hand-set) | ≈ 0.20 |
-| v2 (learned) | 0.527 |
+| v2 (learned, proximity) | 0.535 |
+| v3 (learned, control + stationary ball) | 0.540 |
 
 Regenerate the weights: `git clone https://github.com/metrica-sports/sample-data ../sample-data`
 then `python -m validation.train --samples ../sample-data` (~15 min).

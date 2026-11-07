@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visualiseur de possession</title>
+<!--
+  Visualiseur local pour More than a Hack 2027 -- TercerHombre.
+  Ouvre ce fichier directement dans Chrome ou Edge (double-clic). Tout reste sur ton ordinateur :
+  aucune bibliotheque externe, aucune requete reseau. Les fichiers sont lus par le navigateur,
+  jamais envoyes.
+  Charge : la video tactique, cache/viewer_pack.bin (python -m tools.export_viewer), et un ou
+  plusieurs CSV frame,label (ta soumission, une ancienne version, la verite terrain publique).
+-->
+<style>
+:root{
+  --bg:#0f1115; --panel:#171a21; --line:#2a2f3a; --text:#e6e8ec; --muted:#9aa3b2;
+  --H:#2f6fe4; --A:#e0393e; --D:#6b7280; --X:#1d2129; --ball:#ffd23f; --accent:#f5a524;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+  font:13px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;padding:8px 12px;
+  border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:14px;margin:0 8px 0 0;font-weight:600}
+label.file{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--line);
+  border-radius:6px;cursor:pointer;color:var(--muted)}
+label.file:hover{color:var(--text);border-color:var(--muted)}
+label.file input{display:none}
+label.file.ok{color:var(--text);border-color:#3a8a5a}
+#status{color:var(--muted);margin-left:auto}
+main{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:0;height:calc(100% - 46px - 230px)}
+#stage{position:relative;background:#000;overflow:hidden}
+#stage video,#stage canvas{position:absolute;inset:0;width:100%;height:100%}
+#stage video{object-fit:contain}
+#placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  color:var(--muted);text-align:center;padding:24px}
+aside{border-left:1px solid var(--line);background:var(--panel);padding:10px 12px;overflow:auto}
+aside h2{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:14px 0 6px}
+aside h2:first-child{margin-top:0}
+.big{font-size:22px;font-variant-numeric:tabular-nums;font-weight:600}
+.mono{font-variant-numeric:tabular-nums;font-family:ui-monospace,Consolas,monospace}
+.rowlab{display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--line)}
+.chip{display:inline-block;min-width:22px;text-align:center;border-radius:4px;padding:0 6px;font-weight:600;color:#fff}
+.cH{background:var(--H)}.cA{background:var(--A)}.cD{background:var(--D)}.cX{background:#2b313c;color:var(--muted)}
+kbd{font-family:ui-monospace,Consolas,monospace;font-size:11px;border:1px solid var(--line);border-bottom-width:2px;
+  border-radius:4px;padding:0 4px;color:var(--text)}
+.keys{display:grid;grid-template-columns:auto 1fr;gap:3px 8px;color:var(--muted)}
+button{background:#232833;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:4px 10px;cursor:pointer}
+button:hover{border-color:var(--muted)}
+input[type=text],input[type=number]{background:#0c0e12;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:4px 6px;width:100%}
+textarea{width:100%;height:120px;background:#0c0e12;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px;resize:vertical}
+footer{height:230px;border-top:1px solid var(--line);background:var(--panel);padding:6px 12px;display:flex;flex-direction:column;gap:6px}
+.tl{width:100%;display:block;cursor:pointer}
+#controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+#controls .sep{width:1px;height:18px;background:var(--line)}
+.legend{display:flex;gap:10px;color:var(--muted);align-items:center}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+@media (max-width:820px){main{grid-template-columns:1fr;height:auto}#stage{height:56vw}aside{border-left:0;border-top:1px solid var(--line)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Visualiseur de possession</h1>
+  <label class="file" id="lVideo">Vidéo<input type="file" id="fVideo" accept="video/*"></label>
+  <label class="file" id="lPack">Pack (viewer_pack.bin)<input type="file" id="fPack" accept=".bin"></label>
+  <label class="file" id="lCsv">CSV d'étiquettes<input type="file" id="fCsv" accept=".csv" multiple></label>
+  <span id="status">Charge au moins un CSV pour commencer.</span>
+</header>
+
+<main>
+  <div id="stage">
+    <video id="video" playsinline preload="auto"></video>
+    <canvas id="overlay"></canvas>
+    <div id="placeholder">Sans vidéo, la timeline fonctionne quand même (<kbd>Espace</kbd> pour lire).<br>
+      Ajoute la vidéo tactique et le pack pour voir les joueurs projetés sur l'image.</div>
+  </div>
+  <aside>
+    <h2>Position</h2>
+    <div class="big mono" id="clock">—</div>
+    <div class="mono" style="color:var(--muted)" id="frameinfo">frame —</div>
+    <div style="display:flex;gap:6px;margin-top:6px">
+      <input type="number" id="goto" placeholder="aller au frame…" min="0">
+      <button id="gotoBtn">Aller</button>
+    </div>
+
+    <h2>Étiquettes au frame courant</h2>
+    <div id="labels"></div>
+
+    <h2>Modèle (pack)</h2>
+    <div id="model" style="color:var(--muted)">Charge le pack pour voir P(ballon mort) et P(Barça).</div>
+
+    <h2>Notes</h2>
+    <div style="color:var(--muted);margin-bottom:4px">Pour décrire des <b>tendances</b> d'erreur
+      (« il rate les relances rapides du gardien »), pas pour corriger des frames à la main.</div>
+    <textarea id="notes" placeholder="K ajoute une ligne avec le frame courant"></textarea>
+    <div style="display:flex;gap:6px;margin-top:6px"><button id="noteBtn">+ Note (K)</button><button id="exportBtn">Exporter .txt</button></div>
+
+    <h2>Raccourcis</h2>
+    <div class="keys">
+      <kbd>Espace</kbd><span>lecture / pause</span>
+      <kbd>← →</kbd><span>±1 frame (Maj : ±1 s, Alt : ±10 s)</span>
+      <kbd>N / B</kbd><span>changement suivant / précédent (ligne 1)</span>
+      <kbd>M / V</kbd><span>désaccord suivant / précédent (lignes 1 et 2)</span>
+      <kbd>&lt; &gt;</kbd><span>vitesse</span>
+      <kbd>+ −</kbd><span>zoom de la timeline</span>
+      <kbd>O</kbd><span>afficher / masquer les joueurs</span>
+      <kbd>K</kbd><span>ajouter une note</span>
+    </div>
+  </aside>
+</main>
+
+<footer>
+  <div id="controls">
+    <button id="playBtn">▶ Lire</button>
+    <span class="mono" id="speed">×1</span>
+    <span class="sep"></span>
+    <button id="prevT">◀ chgt</button><button id="nextT">chgt ▶</button>
+    <button id="prevD">◀ désaccord</button><button id="nextD">désaccord ▶</button>
+    <span class="sep"></span>
+    <span class="mono" id="zoomlab">fenêtre 20 s</span>
+    <span class="legend" style="margin-left:auto">
+      <span><i style="background:var(--H)"></i>H</span><span><i style="background:var(--A)"></i>A</span>
+      <span><i style="background:var(--D)"></i>D mort</span><span><i style="background:#2b313c"></i>X</span>
+      <span><i style="background:var(--accent)"></i>coup de pied arrêté</span>
+    </span>
+  </div>
+  <canvas class="tl" id="overview" height="60"></canvas>
+  <canvas class="tl" id="zoom" height="130"></canvas>
+</footer>
+
+<script>
+"use strict";
+const FPS = 25;
+const COL = {0:"#2f6fe4", 1:"#e0393e", 2:"#6b7280", 3:"#1d2129"};
+const LETTER = ["H","A","D","X"];
+const S = {n:0, frame:0, rows:[], pack:null, playing:false, rate:1, zoomSec:20, overlay:true,
+           videoReady:false, timer:null, lastTick:0};
+const $ = id => document.getElementById(id);
+const video = $("video"), overlay = $("overlay"), ov = $("overview"), zm = $("zoom");
+
+function status(msg){ $("status").textContent = msg; }
+
+// ---------------------------------------------------------------- loading
+$("fCsv").addEventListener("change", async e => {
+  for (const file of e.target.files){
+    const text = await file.text();
+    const lines = text.split(/\r?\n/);
+    const codes = new Uint8Array(lines.length);
+    let k = 0;
+    for (let i = 1; i < lines.length; i++){
+      const l = lines[i]; if (!l) continue;
+      const c = l.charCodeAt(l.length - 1) | 32; // lower-case last char
+      codes[k++] = c === 104 ? 0 : c === 97 ? 1 : c === 100 ? 2 : 3;
+    }
+    const row = {name:file.name.replace(/\.csv$/i,""), codes:codes.slice(0,k)};
+    S.rows.push(row);
+    S.n = Math.max(S.n, k);
+  }
+  $("lCsv").classList.add("ok");
+  status(S.rows.map(r => r.name).join(" · ") + " — " + S.n.toLocaleString("fr") + " frames");
+  buildOverview(); draw();
+});
+
+$("fVideo").addEventListener("change", e => {
+  const f = e.target.files[0]; if (!f) return;
+  video.src = URL.createObjectURL(f);
+  $("lVideo").classList.add("ok");
+  $("placeholder").style.display = "none";
+});
+video.addEventListener("loadedmetadata", () => {
+  S.videoReady = true;
+  if (!S.n) S.n = Math.round(video.duration * FPS);
+  seek(S.frame); resize();
+});
+
+$("fPack").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  status("lecture du pack…");
+  const buf = await f.arrayBuffer();
+  const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 8));
+  if (magic !== "MTAHVW01"){ status("ce fichier n'est pas un viewer_pack.bin"); return; }
+  const len = new DataView(buf).getUint32(8, true);
+  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 12, len)));
+  let start = 12 + len; start += (4 - start % 4) % 4;
+  const arrays = {};
+  for (const a of header.arrays){
+    const count = a.shape.reduce((x,y) => x*y, 1);
+    const T = a.dtype === "int16" ? Int16Array : Uint8Array;
+    arrays[a.name] = new T(buf, start + a.offset, count);
+  }
+  header.kickoffs = header.blocks.map(([h, lo, hi]) => {
+    const r = header.restarts.find(([f, k]) => k.includes("kick off") && f >= lo && f <= hi);
+    return r ? r[0] : lo;
+  });
+  S.pack = {h:header, a:arrays, slots:header.n_slots + 1};
+  S.n = Math.max(S.n, header.n_frames);
+  $("lPack").classList.add("ok");
+  status("pack : " + header.home + " (H) – " + header.away + " (A), émissions " + header.emissions);
+  buildOverview(); draw();
+});
+
+// ---------------------------------------------------------------- time
+function clampFrame(f){ return Math.max(0, Math.min((S.n || 1) - 1, Math.round(f))); }
+function seek(f){
+  S.frame = clampFrame(f);
+  if (S.videoReady){ video.currentTime = (S.frame + 0.5) / FPS; }
+  draw();
+}
+function clockOf(f){
+  const p = S.pack;
+  const blocks = p ? p.h.blocks : [[1,11185,90651],[2,110808,190197]];
+  for (let i = 0; i < blocks.length; i++){
+    const [h, lo, hi] = blocks[i];
+    if (f >= lo && f <= hi){
+      const ko = p ? p.h.kickoffs[i] : lo;
+      const s = (f - ko) / FPS, base = h === 1 ? 0 : 45 * 60;
+      const t = base + Math.max(0, s);
+      return (h === 1 ? "1re MT " : "2e MT ") + fmt(t, false) + (s < 0 ? " (avant coup d'envoi)" : "");
+    }
+  }
+  return "hors temps de jeu";
+}
+function fmt(sec, frac){
+  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  const out = String(m).padStart(2,"0") + ":" + String(s).padStart(2,"0");
+  return frac ? out + "." + String(Math.floor((sec % 1) * 100)).padStart(2,"0") : out;
+}
+
+// video drives the frame while playing
+if ("requestVideoFrameCallback" in HTMLVideoElement.prototype){
+  const cb = (now, meta) => { if (!video.paused){ S.frame = clampFrame(meta.mediaTime * FPS); draw(); }
+                              video.requestVideoFrameCallback(cb); };
+  video.requestVideoFrameCallback(cb);
+} else {
+  video.addEventListener("timeupdate", () => { S.frame = clampFrame(video.currentTime * FPS - 0.5); draw(); });
+}
+
+function play(on){
+  S.playing = on;
+  $("playBtn").textContent = on ? "❚❚ Pause" : "▶ Lire";
+  if (S.videoReady){ on ? video.play() : video.pause(); video.playbackRate = S.rate; return; }
+  cancelAnimationFrame(S.timer);
+  if (!on) return;
+  S.lastTick = performance.now();
+  const step = t => { S.frame = clampFrame(S.frame + (t - S.lastTick) / 1000 * FPS * S.rate);
+                      S.lastTick = t; draw(); if (S.playing) S.timer = requestAnimationFrame(step); };
+  S.timer = requestAnimationFrame(step);
+}
+function setRate(r){
+  S.rate = Math.max(0.125, Math.min(16, r));
+  $("speed").textContent = "×" + S.rate;
+  if (S.videoReady) video.playbackRate = S.rate;
+}
+
+// ---------------------------------------------------------------- search
+function nextChange(dir){
+  const r = S.rows[0]; if (!r) return;
+  const c = r.codes; let f = S.frame;
+  const cur = c[f];
+  if (dir > 0){ while (f < c.length - 1 && c[f] === cur) f++; }
+  else { while (f > 0 && c[f - 1] === cur) f--; if (f > 0){ f--; const p = c[f]; while (f > 0 && c[f-1] === p) f--; } }
+  pause(); seek(f);
+}
+function nextDisagree(dir){
+  if (S.rows.length < 2){ status("charge un 2e CSV pour comparer"); return; }
+  const a = S.rows[0].codes, b = S.rows[1].codes, n = Math.min(a.length, b.length);
+  const bad = f => a[f] !== b[f] && a[f] !== 3 && b[f] !== 3;
+  let f = S.frame;
+  if (dir > 0){ while (f < n && bad(f)) f++; while (f < n && !bad(f)) f++; if (f >= n) return; }
+  else { while (f > 0 && bad(f)) f--; while (f > 0 && !bad(f)) f--; if (f <= 0) return; while (f > 0 && bad(f-1)) f--; }
+  pause(); seek(f);
+}
+function pause(){ if (S.playing) play(false); }
+
+// ---------------------------------------------------------------- drawing
+function dpr(){ return window.devicePixelRatio || 1; }
+function fit(c, h){
+  const w = c.clientWidth, r = dpr();
+  c.width = Math.round(w * r); c.height = Math.round(h * r);
+  c.style.height = h + "px";
+  const g = c.getContext("2d"); g.setTransform(r, 0, 0, r, 0, 0); return [g, w, h];
+}
+function resize(){
+  const st = $("stage");
+  overlay.width = Math.round(st.clientWidth * dpr()); overlay.height = Math.round(st.clientHeight * dpr());
+  buildOverview(); draw();
+}
+window.addEventListener("resize", resize);
+
+function trackRows(){
+  const rows = S.rows.map(r => ({name:r.name, codes:r.codes}));
+  return rows;
+}
+
+let ovImage = null;
+function buildOverview(){
+  const rows = trackRows();
+  const rowH = 14, h = Math.max(30, rows.length * (rowH + 2) + (S.pack ? 10 : 0) + 4);
+  const [g, w] = fit(ov, h);
+  g.fillStyle = "#0c0e12"; g.fillRect(0, 0, w, h);
+  if (!S.n){ ovImage = null; return; }
+  const labelW = 110;
+  rows.forEach((r, i) => {
+    const y = 2 + i * (rowH + 2);
+    g.fillStyle = "#9aa3b2"; g.font = "11px system-ui"; g.textBaseline = "middle";
+    g.fillText(r.name.slice(0, 16), 4, y + rowH / 2);
+    const span = w - labelW - 4;
+    for (let x = 0; x < span; x++){
+      const f = Math.floor((x + 0.5) / span * S.n);
+      g.fillStyle = COL[r.codes[f] ?? 3]; g.fillRect(labelW + x, y, 1, rowH);
+    }
+  });
+  if (S.pack){
+    const y = 2 + rows.length * (rowH + 2), span = w - labelW - 4;
+    g.fillStyle = "#9aa3b2"; g.fillText("arrêtés (tag)", 4, y + 4);
+    g.fillStyle = "#f5a524";
+    for (const [s, e, code] of S.pack.h.tags){
+      if (code !== "set pieces") continue;
+      g.fillRect(labelW + s / S.n * span, y, Math.max(1, (e - s) / S.n * span), 8);
+    }
+  }
+  ovImage = g.getImageData(0, 0, ov.width, ov.height);
+}
+
+function draw(){
+  drawOverviewCursor(); drawZoom(); drawOverlay(); drawPanel();
+}
+
+function drawOverviewCursor(){
+  if (!ovImage) return;
+  const g = ov.getContext("2d"); g.setTransform(1,0,0,1,0,0); g.putImageData(ovImage, 0, 0);
+  g.setTransform(dpr(),0,0,dpr(),0,0);
+  const w = ov.clientWidth, labelW = 110, span = w - labelW - 4;
+  const x = labelW + S.frame / S.n * span;
+  g.fillStyle = "#fff"; g.fillRect(x - 0.5, 0, 1.5, ov.clientHeight);
+  const half = S.zoomSec * FPS / 2;
+  g.strokeStyle = "rgba(255,255,255,.5)";
+  g.strokeRect(labelW + (S.frame - half) / S.n * span, 0.5, Math.max(2, 2 * half / S.n * span), ov.clientHeight - 1);
+}
+
+function drawZoom(){
+  const rows = trackRows();
+  const rowH = 16, evH = S.pack ? 46 : 0, axisH = 16;
+  const h = axisH + rows.length * (rowH + 3) + (S.pack ? 12 + evH + 6 : 0) + 4;
+  const [g, w] = fit(zm, Math.max(60, h));
+  g.fillStyle = "#0c0e12"; g.fillRect(0, 0, w, zm.clientHeight);
+  if (!S.n) return;
+  const labelW = 110, span = w - labelW - 4;
+  const half = S.zoomSec * FPS / 2, f0 = S.frame - half, f1 = S.frame + half;
+  const X = f => labelW + (f - f0) / (f1 - f0) * span;
+  const pxPerFrame = span / (f1 - f0);
+
+  // axis: one tick per second
+  g.font = "10px system-ui"; g.textBaseline = "top"; g.fillStyle = "#9aa3b2";
+  const step = S.zoomSec > 120 ? 10 * FPS : S.zoomSec > 40 ? 5 * FPS : FPS;
+  for (let f = Math.ceil(f0 / step) * step; f <= f1; f += step){
+    const x = X(f); g.fillStyle = "#2a2f3a"; g.fillRect(x, axisH - 4, 1, h);
+    g.fillStyle = "#9aa3b2"; g.fillText(fmt(f / FPS, false), x + 2, 1);
+  }
+
+  const drawRun = (codes, y, hh) => {
+    let a = Math.max(0, Math.floor(f0)), end = Math.min(codes.length, Math.ceil(f1) + 1);
+    while (a < end){
+      let b = a; while (b < end && codes[b] === codes[a]) b++;
+      g.fillStyle = COL[codes[a]]; g.fillRect(X(a), y, Math.max(1, (b - a) * pxPerFrame), hh);
+      if (b < end && pxPerFrame > 0.2){ g.fillStyle = "#fff"; g.fillRect(X(b) - 0.5, y, 1, hh); }
+      a = b;
+    }
+  };
+  rows.forEach((r, i) => {
+    const y = axisH + i * (rowH + 3);
+    g.fillStyle = "#9aa3b2"; g.textBaseline = "middle"; g.fillText(r.name.slice(0, 16), 4, y + rowH / 2);
+    drawRun(r.codes, y, rowH);
+  });
+
+  if (S.pack){
+    const a = S.pack.a;
+    let y = axisH + rows.length * (rowH + 3) + 2;
+    // tags + ball seen
+    g.fillStyle = "#9aa3b2"; g.fillText("ballon / tags", 4, y + 4);
+    for (let f = Math.max(0, Math.floor(f0)); f < Math.min(S.n, f1); f++){
+      if (a.ball_seen[f]){ g.fillStyle = "#ffd23f"; g.fillRect(X(f), y + 6, Math.max(1, pxPerFrame), 3); }
+    }
+    for (const [s, e, code, type, team] of S.pack.h.tags){
+      if (e < f0 || s > f1 || code !== "set pieces") continue;
+      const xs = Math.max(labelW, X(s)), xe = Math.min(labelW + span, X(e));
+      g.fillStyle = "#f5a524"; g.fillRect(xs, y, Math.max(1, xe - xs), 4);
+      g.textBaseline = "top"; g.fillText(type || "arrêté", xs + 2, y + 10);
+    }
+    for (const [f] of S.pack.h.restarts){
+      if (f < f0 || f > f1) continue;
+      g.fillStyle = "#fff"; g.beginPath(); g.moveTo(X(f), y); g.lineTo(X(f) - 4, y - 5); g.lineTo(X(f) + 4, y - 5); g.fill();
+    }
+    y += 12;
+    // evidence: P(dead) grey area, P(home) line (top = Barça, bottom = Athletic)
+    g.fillStyle = "#9aa3b2"; g.textBaseline = "middle";
+    g.fillText("P(Barça) / P(mort)", 4, y + evH / 2);
+    g.fillStyle = "#151922"; g.fillRect(labelW, y, span, evH);
+    g.fillStyle = "#2a2f3a"; g.fillRect(labelW, y + evH / 2, span, 1);
+    const stepF = Math.max(1, Math.floor(1 / pxPerFrame));
+    for (let f = Math.max(0, Math.floor(f0)); f < Math.min(S.n, f1); f += stepF){
+      const d = a.p_dead[f] / 255;
+      g.fillStyle = "rgba(160,166,178,.35)"; g.fillRect(X(f), y + evH * (1 - d), Math.max(1, stepF * pxPerFrame), evH * d);
+    }
+    g.beginPath();
+    for (let f = Math.max(0, Math.floor(f0)), first = true; f < Math.min(S.n, f1); f += stepF){
+      const p = a.p_home[f] / 255, yy = y + evH * (1 - p);
+      first ? g.moveTo(X(f), yy) : g.lineTo(X(f), yy); first = false;
+    }
+    g.strokeStyle = "#e6e8ec"; g.lineWidth = 1.2; g.stroke();
+  }
+  // cursor
+  g.fillStyle = "#fff"; g.fillRect(X(S.frame) - 0.5, 0, 1.5, zm.clientHeight);
+}
+
+function drawOverlay(){
+  const g = overlay.getContext("2d");
+  g.setTransform(1,0,0,1,0,0); g.clearRect(0, 0, overlay.width, overlay.height);
+  if (!S.pack || !S.overlay) return;
+  const vw = video.videoWidth || 1920, vh = video.videoHeight || 1080;
+  const cw = overlay.width, ch = overlay.height;
+  const sc = Math.min(cw / vw, ch / vh), ox = (cw - vw * sc) / 2, oy = (ch - vh * sc) / 2;
+  const r = dpr(), xy = S.pack.a.xy, k = S.pack.slots, base = S.frame * k * 2;
+  const team = S.pack.h.team;
+  for (let s = 0; s < k; s++){
+    const u = xy[base + 2 * s], v = xy[base + 2 * s + 1];
+    if (u === -32768) continue;
+    const x = ox + u * sc, y = oy + v * sc;
+    const ball = s === k - 1;
+    g.beginPath(); g.arc(x, y, (ball ? 4.5 : 6) * r, 0, 2 * Math.PI);
+    g.fillStyle = ball ? "#ffd23f" : team[s] === 0 ? "#2f6fe4" : "#e0393e";
+    g.fill(); g.lineWidth = 1.5 * r; g.strokeStyle = ball ? "#000" : "#fff"; g.stroke();
+  }
+  const lab = S.rows[0] ? LETTER[S.rows[0].codes[S.frame] ?? 3] : null;
+  g.font = (16 * r) + "px system-ui"; g.textBaseline = "top";
+  if (xy[base + 2 * (k - 1)] === -32768){
+    g.fillStyle = "rgba(0,0,0,.6)"; g.fillRect(8 * r, 8 * r, 250 * r, 26 * r);
+    g.fillStyle = "#ffd23f"; g.fillText("ballon non suivi sur ce frame", 14 * r, 13 * r);
+  }
+  if (lab){
+    g.fillStyle = lab === "H" ? "#2f6fe4" : lab === "A" ? "#e0393e" : "#6b7280";
+    g.fillRect(cw - 60 * r, 8 * r, 52 * r, 30 * r);
+    g.fillStyle = "#fff"; g.font = "bold " + (20 * r) + "px system-ui"; g.fillText(lab, cw - 41 * r, 12 * r);
+  }
+}
+
+function drawPanel(){
+  const f = S.frame;
+  $("clock").textContent = clockOf(f);
+  $("frameinfo").textContent = "frame " + f.toLocaleString("fr") + "  ·  vidéo " + fmt(f / FPS, true);
+  $("labels").innerHTML = S.rows.map(r => {
+    const L = LETTER[r.codes[f] ?? 3];
+    return `<div class="rowlab"><span>${r.name}</span><span class="chip c${L}">${L}</span></div>`;
+  }).join("") || '<span style="color:var(--muted)">aucun CSV chargé</span>';
+  if (S.pack){
+    const a = S.pack.a;
+    $("model").innerHTML = `P(ballon mort) <b class="mono">${Math.round(a.p_dead[f] / 2.55)} %</b><br>
+      P(Barça | en jeu) <b class="mono">${Math.round(a.p_home[f] / 2.55)} %</b><br>
+      ballon suivi : <b>${a.ball_seen[f] ? "oui" : "non"}</b>`;
+  }
+  $("zoomlab").textContent = "fenêtre " + S.zoomSec + " s";
+}
+
+// ---------------------------------------------------------------- interaction
+function frameFromCanvas(c, ev, zoomed){
+  const rect = c.getBoundingClientRect(), labelW = 110, span = rect.width - labelW - 4;
+  const x = ev.clientX - rect.left - labelW;
+  if (!zoomed) return x / span * S.n;
+  const half = S.zoomSec * FPS / 2;
+  return S.frame - half + x / span * 2 * half;
+}
+let drag = null;
+for (const [c, z] of [[ov, false], [zm, true]]){
+  c.addEventListener("pointerdown", e => { drag = z; pause(); seek(frameFromCanvas(c, e, z)); });
+  c.addEventListener("pointermove", e => { if (drag === z && e.buttons) seek(frameFromCanvas(c, e, z)); });
+}
+window.addEventListener("pointerup", () => drag = null);
+zm.addEventListener("wheel", e => { e.preventDefault(); zoomBy(e.deltaY > 0 ? 1.25 : 0.8); }, {passive:false});
+function zoomBy(k){ S.zoomSec = Math.max(4, Math.min(1800, Math.round(S.zoomSec * k))); draw(); }
+
+$("playBtn").onclick = () => play(!S.playing);
+$("prevT").onclick = () => nextChange(-1); $("nextT").onclick = () => nextChange(1);
+$("prevD").onclick = () => nextDisagree(-1); $("nextD").onclick = () => nextDisagree(1);
+$("gotoBtn").onclick = () => { pause(); seek(+$("goto").value || 0); };
+$("goto").addEventListener("keydown", e => { if (e.key === "Enter") $("gotoBtn").click(); });
+video.addEventListener("ended", () => play(false));
+
+// notes, kept in this browser only
+const NOTE_KEY = "mtah-viewer-notes";
+try { $("notes").value = localStorage.getItem(NOTE_KEY) || ""; } catch (_) {}
+$("notes").addEventListener("input", () => { try { localStorage.setItem(NOTE_KEY, $("notes").value); } catch (_) {} });
+function addNote(){
+  const labs = S.rows.map(r => r.name + "=" + LETTER[r.codes[S.frame] ?? 3]).join(" ");
+  const t = $("notes"); t.value += (t.value && !t.value.endsWith("\n") ? "\n" : "") +
+    `[${S.frame}] ${clockOf(S.frame)} ${labs} : `;
+  t.focus(); t.selectionStart = t.selectionEnd = t.value.length;
+  try { localStorage.setItem(NOTE_KEY, t.value); } catch (_) {}
+}
+$("noteBtn").onclick = addNote;
+$("exportBtn").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([$("notes").value], {type:"text/plain"}));
+  a.download = "notes_visualiseur.txt"; a.click();
+};
+
+window.addEventListener("keydown", e => {
+  if (["INPUT","TEXTAREA"].includes(document.activeElement.tagName)) return;
+  const k = e.key;
+  if (k === " "){ e.preventDefault(); play(!S.playing); }
+  else if (k === "ArrowRight" || k === "ArrowLeft"){
+    e.preventDefault(); pause();
+    const d = (e.altKey ? 10 * FPS : e.shiftKey ? FPS : 1) * (k === "ArrowRight" ? 1 : -1);
+    seek(S.frame + d);
+  }
+  else if (k === "n" || k === "N") nextChange(1);
+  else if (k === "b" || k === "B") nextChange(-1);
+  else if (k === "m" || k === "M") nextDisagree(1);
+  else if (k === "v" || k === "V") nextDisagree(-1);
+  else if (k === ">" || k === ".") setRate(S.rate * 2);
+  else if (k === "<" || k === ",") setRate(S.rate / 2);
+  else if (k === "+" || k === "=") zoomBy(0.8);
+  else if (k === "-" || k === "_") zoomBy(1.25);
+  else if (k === "o" || k === "O"){ S.overlay = !S.overlay; draw(); }
+  else if (k === "k" || k === "K"){ e.preventDefault(); addNote(); }
+});
+
+resize();
+</script>
+</body>
+</html>

@@ -55,7 +55,7 @@ def _fill(x, value):
     return np.where(np.isfinite(x), x, value)
 
 
-def dead_features(f, blocks, pitch):
+def dead_features(f, blocks, pitch, variant=None):
     n = len(f["ball_seen"])
     length, width = pitch
     act = f["activity"].astype(np.float64)
@@ -90,10 +90,58 @@ def dead_features(f, blocks, pitch):
         _fill(_win_mean(f["ball_out"].astype(np.float64), FPS // 2, blocks, n), 0.0),
         np.log1p(f["gap_len"] / float(FPS)),
     ]
+    if "stationary" in f and variant != "v2":
+        st = f["stationary"].astype(np.float64)
+        cols += [
+            _fill(_win_mean(st, FPS, blocks, n), 0.0),
+            _fill(_win_mean(st, 3 * FPS, blocks, n), 0.0),
+            _fill(_shift_mean(st, 1, 3 * FPS, blocks, n), 0.0),   # ball about to be placed/struck
+            _fill(_shift_mean(st, -3 * FPS, 0, blocks, n), 0.0),  # ball was resting just before
+        ]
     return np.column_stack(cols)
 
 
-def team_features(f, blocks, pitch, ball_evidence):
+def _carry(sign, max_age, blocks, n):
+    """Last non-zero value of `sign` within the past `max_age` frames (0 if none), per block."""
+    out = np.zeros(n)
+    for _, lo, hi in blocks:
+        seg = sign[lo:hi + 1]
+        idx = np.where(seg != 0, np.arange(len(seg)), -1)
+        last = np.maximum.accumulate(idx)
+        age = np.arange(len(seg)) - last
+        val = np.where(last >= 0, seg[np.maximum(last, 0)], 0)
+        out[lo:hi + 1] = np.where((last >= 0) & (age <= max_age), val, 0)
+    return out
+
+
+TEAM_VARIANT = "ctrl_causal"
+
+
+def team_features(f, blocks, pitch, ball_evidence, variant=None):
+    variant = variant or TEAM_VARIANT
+    if variant == "v2":
+        return _team_v2(f, blocks, pitch, ball_evidence)
+    n = len(f["ball_seen"])
+    ev = ball_evidence.astype(np.float64)
+    evn = np.where(ev != 0, ev, np.nan)
+    c = f["control"].astype(np.float64)
+    base = _team_v2(f, blocks, pitch, ball_evidence)
+    if variant == "ctrl_causal":
+        # drop the two windows that look ahead (centred 2 s, next 2 s); keep past and present
+        base = np.delete(base, [2, 4], axis=1)
+        base = np.column_stack([base, _fill(_shift_mean(evn, -4 * FPS, -2 * FPS, blocks, n), 0.0)])
+    cols = [
+        _carry(f["control"], 2 * FPS, blocks, n),
+        _carry(f["control"], 6 * FPS, blocks, n),
+        _fill(_win_mean(c, 5, blocks, n), 0.0),
+        _fill(_shift_mean(c, -FPS, 0, blocks, n), 0.0),
+    ]
+    if variant == "ctrl":
+        cols.append(_fill(_shift_mean(c, 1, FPS, blocks, n), 0.0))
+    return np.column_stack([base] + cols)
+
+
+def _team_v2(f, blocks, pitch, ball_evidence):
     n = len(f["ball_seen"])
     length = pitch[0]
     ev = ball_evidence.astype(np.float64)
@@ -145,7 +193,9 @@ def load_weights(path=WEIGHTS):
 
 def emissions(f, blocks, pitch, ball_evidence, weights):
     """(s_team, s_dead) log-odds from the learned models, scaled by the stored temperatures."""
-    s_dead = logit(weights["dead"], dead_features(f, blocks, pitch)) * weights.get("t_dead", 1.0)
-    s_team = logit(weights["team"], team_features(f, blocks, pitch, ball_evidence)) \
+    s_dead = logit(weights["dead"], dead_features(f, blocks, pitch, weights.get("dead_variant", "v2"))) \
+        * weights.get("t_dead", 1.0)
+    s_team = logit(weights["team"], team_features(f, blocks, pitch, ball_evidence,
+                                                  weights.get("team_variant", "v2"))) \
         * weights.get("t_team", 1.0)
     return s_team.astype(np.float32), s_dead.astype(np.float32)

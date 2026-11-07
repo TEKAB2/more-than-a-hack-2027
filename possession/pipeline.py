@@ -43,8 +43,9 @@ def summarise(labels, blocks):
         np.median(spells) / 25 if spells else 0, dead / graded))
 
 
-def run(team, data_dir=None, game=GAME, params=None, costs=None, use_tagging=True,
-        weights_path=None):
+def infer(data_dir=None, game=GAME, params=None, costs=None, use_tagging=True,
+          weights_path=None, verbose=True):
+    """Everything up to the labels, nothing written. Returns a dict (also used by tools/)."""
     meta, raw, tags_path = require(["atd_meta", "atd_raw", "smart_tagging"], game, data_dir)
     n = source_frames("tactical", game)
     pitch = GAMES[game]["pitch"]
@@ -65,13 +66,24 @@ def run(team, data_dir=None, game=GAME, params=None, costs=None, use_tagging=Tru
     if weights_path:
         weights = model.load_weights(weights_path)
         costs = dict(weights.get("costs", {}), **(costs or {}))
-        print("emissions: learned ({}), held-out spellF1 on sample games {:.3f}".format(
-            os.path.relpath(weights_path, ROOT), weights.get("held_out_spell_f1", float("nan"))))
-    else:
+        if verbose:
+            print("emissions: learned ({}), held-out spellF1 on sample games {:.3f}".format(
+                os.path.relpath(weights_path, ROOT),
+                weights.get("held_out_spell_f1", float("nan"))))
+    elif verbose:
         print("emissions: hand-set v1 parameters")
     s_team, s_dead, restarts = emissions.compute(feats, blocks, tag_prior, pieces, goals, params,
                                                  weights, pitch)
     labels = decode.decode(s_team, s_dead, blocks, n, costs)
+    return {"labels": labels, "s_team": s_team, "s_dead": s_dead, "restarts": restarts,
+            "atd": data, "features": feats, "blocks": blocks, "pitch": pitch,
+            "home": home, "away": away, "n": n}
+
+
+def run(team, data_dir=None, game=GAME, params=None, costs=None, use_tagging=True,
+        weights_path=None):
+    out = infer(data_dir, game, params, costs, use_tagging, weights_path)
+    labels = out["labels"]
 
     out_dir = os.path.join(ROOT, "submissions")
     os.makedirs(out_dir, exist_ok=True)
@@ -80,8 +92,9 @@ def run(team, data_dir=None, game=GAME, params=None, costs=None, use_tagging=Tru
         handle.write("frame,label\n")
         handle.writelines("{},{}\n".format(i, label) for i, label in enumerate(labels))
 
-    print("H = {}, A = {}   restarts detected: {}".format(home, away, len(restarts)))
-    summarise(labels, blocks)
+    print("H = {}, A = {}   restarts detected: {}".format(out["home"], out["away"],
+                                                          len(out["restarts"])))
+    summarise(labels, out["blocks"])
     print("->", os.path.relpath(path, ROOT))
     return path
 

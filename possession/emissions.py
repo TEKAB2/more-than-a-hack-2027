@@ -58,24 +58,27 @@ def ball_team_evidence(f, p):
 
 
 def find_restart(f, start, end, lo, hi, centre=None):
-    """First frame in [start-2s, end+1s] where a resting ball is struck. None if not found.
+    """First frame in [start-2s, end+1s] where a resting ball starts to move. None if not found.
 
-    For a kick-off, `centre` = (x, y) of the centre spot: the strike must happen there.
+    "Resting" = seen and within 0.3 m of the same spot for the previous 8 frames; "moves" = more
+    than 0.6 m away 3 frames later. Position-based rather than speed-based, so a soft kick-off pass
+    is caught on the frame it is struck, not a second later when it has picked up speed.
+    For a kick-off, `centre` = (x, y) of the centre spot: the ball must rest there.
     """
-    speed = f["ball_speed"]
-    a, b = max(lo, start - 2 * FPS), min(hi, end + FPS)
-    for t in range(a + 10, b):
-        if not f["ball_seen"][t] or np.isnan(speed[t]) or speed[t] < 4.0:
+    b, seen = f["ball"], f["ball_seen"]
+    a, z = max(lo + 8, start - 2 * FPS), min(hi - 4, end + FPS)
+    for t in range(a, z):
+        if not (seen[t - 1] and seen[t - 8]) or np.isnan(b[t + 3, 0]):
             continue
-        if centre is not None and np.hypot(f["ball"][t - 5, 0] - centre[0],
-                                           f["ball"][t - 5, 1] - centre[1]) > 3.0:
+        rest = b[t - 1]
+        if np.hypot(*(b[t - 8:t] - rest).T).max() > 0.3:
             continue
-        before = speed[t - 10:t]
-        before = before[~np.isnan(before)]
-        if len(before) >= 3 and np.median(before) < 2.0:
-            return t
+        if np.hypot(*(b[t + 3] - rest)) < 0.6:
+            continue
+        if centre is not None and np.hypot(rest[0] - centre[0], rest[1] - centre[1]) > 3.0:
+            continue
+        return t
     return None
-
 
 def compute(f, blocks, tag_prior=None, set_pieces=(), goals=(), params=None, weights=None,
             pitch=None):

@@ -28,16 +28,16 @@ from possession import decode, emissions, features, model  # noqa: E402
 from validation import external as E  # noqa: E402
 
 GRID = {
-    "switch": (6.0, 10.0, 15.0, 22.0, 32.0),
-    "to_dead": (4.0, 8.0, 14.0),
-    "restart": (4.0, 8.0, 14.0),
-    "t_team": (0.5, 1.0),
-    "t_dead": (0.5, 1.0),
+    "switch": (6.0, 10.0, 15.0),
+    "to_dead": (10.0, 14.0, 20.0),
+    "restart": (10.0, 14.0, 20.0),
+    "t_team": (0.7, 1.0),
+    "t_dead": (0.35, 0.5),
 }
 SUBSAMPLE = 4  # every 4th frame for fitting: neighbouring frames are near-duplicates
 
 
-def build(samples, seeds):
+def build(samples, seeds, team_variant, dead_variant):
     rows = []
     for seed in seeds:
         for name, atd, blocks, labels, events in E.prepare(samples, seed=seed):
@@ -46,8 +46,8 @@ def build(samples, seeds):
             rows.append({
                 "pieces": E.fake_set_piece_tags(events, np.random.default_rng(seed + 100)),
                 "name": name, "seed": seed, "blocks": blocks, "labels": labels, "events": events,
-                "f": f, "Xd": model.dead_features(f, blocks, E.PITCH),
-                "Xt": model.team_features(f, blocks, E.PITCH, ev),
+                "f": f, "Xd": model.dead_features(f, blocks, E.PITCH, dead_variant),
+                "Xt": model.team_features(f, blocks, E.PITCH, ev, team_variant),
             })
     return rows
 
@@ -84,20 +84,81 @@ def evaluate(rows, weights, costs, logits=None):
         pred = decode.decode(s_team, s_dead, r["blocks"], len(r["labels"]), costs)
         res = pm.evaluate(pm.label_codes(r["labels"]), pm.label_codes(pred), bootstrap_n=0)
         scores.append((res["spell_f1_mean"], res["macro_f1"], res["n_gt_spells"],
-                        res["n_pred_spells"]))
+                        res["n_pred_spells"]) + timing(r["labels"], pred))
     return scores
+
+
+def _changes(labels):
+    out = []
+    for i in np.flatnonzero(labels[1:] != labels[:-1]) + 1:
+        a, b = labels[i - 1], labels[i]
+        if "X" in (a, b):
+            continue
+        out.append((i, a, b))
+    return out
+
+
+def timing(gt, pred, window=5 * 25):
+    """(median delay of team changes s, median delay of restarts s, short-possession recall).
+
+    Delay = predicted frame - true frame for the nearest predicted change of the same kind within
+    5 s; negative = early. Short possessions (< 3 s) count as found when a predicted spell of the
+    same team overlaps them with IoU >= 0.5.
+    """
+    P = _changes(pred)
+    pf = np.array([p[0] for p in P])
+    team_d, restart_d = [], []
+    for f, a, b in _changes(gt):
+        kind = "team" if {a, b} == {"H", "A"} else "restart" if a == "D" else None
+        if kind is None or not len(pf):
+            continue
+        cands = [p for p in P if abs(p[0] - f) <= window and p[2] == b
+                 and ((kind == "team" and p[1] in "HA") or (kind == "restart" and p[1] == "D"))]
+        if cands:
+            d = min(cands, key=lambda p: abs(p[0] - f))[0] - f
+            (team_d if kind == "team" else restart_d).append(d / 25.0)
+    runs, short_hit, short_n = [], 0, 0
+    i = 0
+    while i < len(gt):
+        j = i
+        while j < len(gt) and gt[j] == gt[i]:
+            j += 1
+        if gt[i] in "HA" and j - i < 3 * 25:
+            short_n += 1
+            lo, hi = max(0, i - 75), min(len(pred), j + 75)
+            seg = pred[lo:hi] == gt[i]
+            k = 0
+            while k < len(seg):
+                if seg[k]:
+                    m = k
+                    while m < len(seg) and seg[m]:
+                        m += 1
+                    a, b = lo + k, lo + m
+                    inter = max(0, min(b, j) - max(a, i))
+                    if inter / float(max(b, j) - min(a, i)) >= 0.5:
+                        short_hit += 1
+                        break
+                    k = m
+                else:
+                    k += 1
+        i = j
+    med = lambda x: float(np.median(x)) if x else float("nan")  # noqa: E731
+    return med(team_d), med(restart_d), short_hit / max(short_n, 1)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--samples", required=True)
     parser.add_argument("--out", default=model.WEIGHTS)
+    parser.add_argument("--team-variant", default=model.TEAM_VARIANT)
+    parser.add_argument("--dead-variant", default="stat")
     args = parser.parse_args()
 
-    rows = build(args.samples, seeds=(0, 1))
+    rows = build(args.samples, (0, 1), args.team_variant, args.dead_variant)
     names = sorted({r["name"] for r in rows})
     combos = list(itertools.product(*GRID.values()))
     held = {c: [] for c in combos}
+    timings = {}
 
     for name in names:
         train = [r for r in rows if r["name"] != name]
@@ -108,16 +169,22 @@ def main():
             setting = dict(zip(GRID, c))
             w = dict(base, t_team=setting["t_team"], t_dead=setting["t_dead"])
             costs = {k: setting[k] for k in ("switch", "to_dead", "restart")}
-            held[c] += [s[0] for s in evaluate(test, w, costs, logits)]
+            res = evaluate(test, w, costs, logits)
+            held[c] += [s[0] for s in res]
+            timings.setdefault(c, []).extend(s[4:] for s in res)
         print("fold {} done".format(name))
 
     ranked = sorted(combos, key=lambda c: -np.mean(held[c]))
     for c in ranked[:5]:
         print("held-out spellF1 {:.4f}  {}".format(np.mean(held[c]), dict(zip(GRID, c))))
     best = dict(zip(GRID, ranked[0]))
+    t = np.array(timings[ranked[0]], dtype=float)
+    print("held-out timing (median over games): team change {:+.2f}s  restart {:+.2f}s  "
+          "short possessions found {:.0%}".format(*np.nanmedian(t, axis=0)))
 
     weights = fit(rows)
     weights.update(t_team=best["t_team"], t_dead=best["t_dead"],
+                   team_variant=args.team_variant, dead_variant=args.dead_variant,
                    costs={k: best[k] for k in ("switch", "to_dead", "restart")},
                    held_out_spell_f1=float(np.mean(held[ranked[0]])),
                    trained_on="metrica-sports/sample-data games 1-3, degraded, seeds 0-1")
@@ -126,8 +193,9 @@ def main():
     print("final, in-sample:")
     for (name, seed), s in zip([(r["name"], r["seed"]) for r in rows],
                                evaluate(rows, weights, weights["costs"])):
-        print("  {} seed{}  spellF1 {:.4f} macroF1 {:.4f}  poss gt {} pred {}".format(
-            name, seed, *s))
+        print("  {} seed{}  spellF1 {:.4f} macroF1 {:.4f}  poss gt {} pred {}  "
+              "delay team {:+.2f}s restart {:+.2f}s  short-poss recall {:.2f}".format(
+                  name, seed, *s))
     print("->", os.path.relpath(args.out, ROOT))
 
 

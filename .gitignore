@@ -66,3 +66,5 @@ env/
 # team pipeline
 cache/
 submissions/
+# open Bundesliga matches (CC BY 4.0, downloaded by validation/fetch_idsse.py)
+validation/external_data/

@@ -58,3 +58,45 @@ def decode(s_team, s_dead, blocks, n_frames, costs=None):
         path = viterbi(log_em[first:last + 1], costs)
         labels[first:last + 1] = LETTERS[path]
     return labels
+
+
+def insert_control_spells(labels, control, blocks, min_len=10, gap=3, tail=12):
+    """Second pass: give back short possessions the Viterbi swallowed.
+
+    Inside a possession of one team, a run of >= `min_len` frames where the OTHER team controls
+    the ball (control sign, gaps of <= `gap` frames bridged) is a recovery: label it for that team
+    from the start of the run until `tail` frames after its end, or until the original team
+    controls the ball again. Dead-ball frames are never touched.
+    """
+    out = labels.copy()
+    for _, lo, hi in blocks:
+        c = control[lo:hi + 1]
+        lab = out[lo:hi + 1]
+        for team_letter, sign in (("H", 1), ("A", -1)):
+            mine = c == sign
+            # bridge small gaps
+            idx = np.flatnonzero(mine)
+            if not len(idx):
+                continue
+            runs, start, prev = [], idx[0], idx[0]
+            for i in idx[1:]:
+                if i - prev > gap + 1:
+                    runs.append((start, prev + 1))
+                    start = i
+                prev = i
+            runs.append((start, prev + 1))
+            for a, b in runs:
+                if b - a < min_len:
+                    continue
+                seg = lab[a:b]
+                other = "A" if team_letter == "H" else "H"
+                if not np.any(seg == other):
+                    continue
+                end = min(len(lab), b + tail)
+                back = np.flatnonzero(c[b:end] == -sign)
+                if len(back):
+                    end = b + back[0]
+                span = slice(a, end)
+                lab[span] = np.where(lab[span] == "D", "D", team_letter)
+        out[lo:hi + 1] = lab
+    return out
