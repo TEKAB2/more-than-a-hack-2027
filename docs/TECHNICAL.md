@@ -42,28 +42,43 @@ method is built around one idea: **decide possession as a hidden state, not fram
 
 No label of the provided game is used, in any amount.
 
-* **Metrica Sports public sample data** (github.com/metrica-sports/sample-data), three full
-  matches with tracking and human event data, labelled by Metrica.
-* Frame labels are derived from the events by a fixed rule (`validation/external.py`): an on-ball
-  event (set piece, pass, carry, recovery, shot) gives possession to its team; a ball out, a shot
-  out or in goal, or a foul starts a dead ball that lasts until the next on-ball event. Challenges
-  and ball losses change nothing by themselves.
-* The clean tracking is **degraded to resemble the ATD**: ball missing on 41 % of frames in bursts,
+* **IDSSE open Bundesliga data** — 7 full matches, 2022/23 Bundesliga 1 and 2 (Bassek et al.,
+  *An integrated dataset of spatiotemporal and event data in elite soccer*, Scientific Data 12,
+  195, 2025; CC BY 4.0; downloaded with kloppy by `validation/fetch_idsse.py`). Their DFL
+  position data carries, on every frame, the league's corrected **BallStatus** and
+  **BallPossession** — the same kind of fields the challenge's ground truth is derived from.
+  DFL switches possession on any touch, so an opponent spell shorter than 1.6 s between two
+  spells of the same team is handed back to that team (`merge_brief`); 1.6 s is the value at which
+  these games reproduce the possession statistics of Metrica's own public games (≈ 350 per
+  match, ≈ 30 % under 3 s).
+* **Metrica Sports public sample data** — 3 full matches with tracking and human event data.
+  Frame labels are derived from the events: an on-ball event (set piece, pass, carry, recovery,
+  shot) gives possession to its team; a ball out, a shot out or in goal, or a foul starts a dead
+  ball that lasts until the next on-ball event.
+* All tracking is **degraded to resemble the ATD**: ball missing on 41 % of frames in bursts,
   more often when the ball is crowded or fast; low-frequency positional error; player track gaps.
-* Models are fitted and the decoder costs chosen by **leave-one-game-out** cross-validation on
-  spellF1 (`validation/train.py`). The official nearest-player baseline (±2 s window) scores
-  ≈ 0.25 on the same protocol (0.2433 on BAR-ATH), which suggests the protocol is a fair proxy for
-  difficulty.
+  Restarts are given to the model as noisy pseudo-tags (jittered, often missing, throw-ins
+  without a team), like the Smart Tagging.
+* Emission models: gradient-boosted trees (scikit-learn `HistGradientBoostingClassifier`, fixed
+  seed), exported to plain JSON (`possession/weights_trees.json`) and evaluated with numpy, so
+  producing the submission needs only numpy and pandas on any Python ≥ 3.8; scikit-learn
+  (Python ≥ 3.11) is needed only to retrain. Decoder costs and temperatures are chosen by **leave-one-game-out** cross-validation on
+  spellF1 over the 10 games (`validation/train.py`).
 
-  | held-out, sample games | spellF1 | median delay of a change of team |
-  |---|---|---|
-  | baseline ±2 s | ≈ 0.25 | — |
-  | v2 (proximity features) | 0.535 | −0.21 s (early) |
-  | **v3 (control + stationary ball)** | **0.540** | +0.27 s |
-  | v3 without any look-ahead window | 0.532 | +0.59 s (late) |
+| held out, 10 games | spellF1 | delay of a change of team | short possessions found |
+|---|---|---|---|
+| official baseline (±2 s window) | 0.239 | — | — |
+| logistic, proximity + control features | 0.533 | +0.09 s | 9 % |
+| logistic, + touch detection | 0.543 | +0.08 s | 14 % |
+| **boosted trees, + touch detection** | **0.564** | +0.04 s | 19 % |
 
-  The gain of v3 is within noise on three games; it is kept because it removes the early bias
-  observed when watching BAR-ATH and because its features state the possession rule directly.
+The baseline scores 0.239 here and 0.2433 on BAR-ATH, which suggests the protocol is a fair proxy
+for the difficulty of the real task.
+
+**Touch detection** (`features.detect_touches`, after Link & Hoernig, *PLoS ONE* 2017, and
+ELASTIC, Kim et al., 2025): a local peak of the ball's acceleration (≥ 10 m/s²) or a sharp change
+of direction (≥ 25°) while a player is within 2 m. "Two touches in a row by one team" is the
+observable proxy used for *controlled* possession.
 
 ## 4. Possession rules implemented
 

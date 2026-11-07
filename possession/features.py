@@ -145,6 +145,8 @@ def control_features(f, players, team, blocks, dist):
     f["control"] = np.zeros(n, dtype=np.int8)        # +1 home controls, -1 away, 0 nobody
     f["stationary"] = np.zeros(n, dtype=bool)
     f["ball_disp"] = np.full(n, np.nan, dtype=np.float32)  # metres moved over the last 0.4 s
+    f["touch"] = np.zeros(n, dtype=np.int8)     # +1 / -1 on the frame a home / away player touches
+    f["touch2"] = np.zeros(n, dtype=np.int8)    # same, only for a touch that follows a team-mate's
     nearest = np.argmin(dist, axis=1)
     dmin = dist[np.arange(n), nearest]
     for _, lo, hi in blocks:
@@ -160,6 +162,8 @@ def control_features(f, players, team, blocks, dist):
             ctrl = seen & (dmin[sl] < 1.5) & (np.nan_to_num(rel, nan=99) < 2.5)
         sign = np.where(team[idx] == 0, 1, -1).astype(np.int8)
         f["control"][sl] = np.where(ctrl, sign, 0)
+
+        f["touch"][sl], f["touch2"][sl] = detect_touches(b, seen, p, team, dmin[sl], idx)
 
         disp = np.full(len(b), np.nan, dtype=np.float32)
         disp[10:] = np.hypot(b[10:, 0] - b[:-10, 0], b[10:, 1] - b[:-10, 1])
@@ -180,3 +184,50 @@ class _null:
 
     def __exit__(self, *exc):
         return self._ctx.__exit__(*exc)
+
+
+def detect_touches(b, seen, p, team, dmin, nearest, min_acc=10.0, min_turn=25.0, radius=2.0):
+    """Ball touches, after Link & Hoernig (2017) and ELASTIC (Kim et al., 2025): a touch is a local
+    peak of the ball's acceleration (or a sharp change of direction) while a player is within
+    `radius` metres. Returns (touch, touch2) per frame: +1/-1 for a touch by home/away on its frame,
+    and touch2 marking only touches that follow a touch by a team-mate -- two touches in a row by
+    one team is the simplest observable proxy for the challenge's "controlled possession".
+    """
+    n = len(b)
+    touch = np.zeros(n, dtype=np.int8)
+    touch2 = np.zeros(n, dtype=np.int8)
+    if n < 20:
+        return touch, touch2
+    # light smoothing of the (interpolated) ball before differentiating
+    k = 2
+    sm = np.full(b.shape, np.nan, dtype=np.float64)
+    cs = np.cumsum(np.nan_to_num(b, nan=0.0), axis=0)
+    sm[k + 1:n - k] = (cs[2 * k + 1:] - cs[:n - 2 * k - 1]) / (2 * k + 1)
+    v = np.full(b.shape, np.nan)
+    v[1:-1] = (sm[2:] - sm[:-2]) * (FPS / 2.0)
+    acc = np.full(n, np.nan)
+    acc[1:-1] = np.hypot(*(v[2:] - v[:-2]).T) * (FPS / 2.0)
+    vin = np.full(b.shape, np.nan)
+    vout = np.full(b.shape, np.nan)
+    vin[3:] = sm[3:] - sm[:-3]
+    vout[:-3] = sm[3:] - sm[:-3]
+    dot = (vin * vout).sum(axis=1)
+    norm = np.hypot(*vin.T) * np.hypot(*vout.T)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        turn = np.degrees(np.arccos(np.clip(dot / norm, -1, 1)))
+        moving = (np.hypot(*vin.T) > 0.15) | (np.hypot(*vout.T) > 0.15)   # > ~1.2 m/s
+    a = np.nan_to_num(acc, nan=0.0)
+    peak = np.zeros(n, dtype=bool)
+    peak[3:-3] = (a[3:-3] >= np.maximum.reduce([a[i:n - 6 + i] for i in range(7)]))
+    seen_ok = np.convolve(seen.astype(float), np.ones(5) / 5, mode="same") >= 0.6
+    with np.errstate(invalid="ignore"):
+        cand = peak & seen_ok & (dmin < radius) & (
+            (a >= min_acc) | (np.nan_to_num(turn) >= min_turn) & moving)
+    last_team, last_t = 0, -10 ** 9
+    for t in np.flatnonzero(cand):
+        sign = 1 if team[nearest[t]] == 0 else -1
+        touch[t] = sign
+        if last_team == sign and t - last_t < 4 * FPS:
+            touch2[t] = sign
+        last_team, last_t = sign, t
+    return touch, touch2

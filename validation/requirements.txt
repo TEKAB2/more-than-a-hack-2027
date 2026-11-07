@@ -1,1 +1,3 @@
+# Only to regenerate possession/weights*.json (not needed to produce the submission).
 kloppy==3.19.1
+scikit-learn==1.9.1

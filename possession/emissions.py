@@ -66,12 +66,16 @@ def find_restart(f, start, end, lo, hi, centre=None):
     For a kick-off, `centre` = (x, y) of the centre spot: the ball must rest there.
     """
     b, seen = f["ball"], f["ball_seen"]
-    a, z = max(lo + 8, start - 2 * FPS), min(hi - 4, end + FPS)
+    # The rest window may be shorter than 8 frames at the very start of a half: the first graded
+    # frame of the first half IS the kick-off, so requiring 8 frames before it would push the
+    # detected strike a second late.
+    a, z = max(lo + 1, start - 2 * FPS), min(hi - 4, end + FPS)
     for t in range(a, z):
-        if not (seen[t - 1] and seen[t - 8]) or np.isnan(b[t + 3, 0]):
+        w0 = max(lo, t - 8)
+        if not (seen[t - 1] and seen[w0]) or np.isnan(b[t + 3, 0]):
             continue
         rest = b[t - 1]
-        if np.hypot(*(b[t - 8:t] - rest).T).max() > 0.3:
+        if np.hypot(*(b[w0:t] - rest).T).max() > 0.3:
             continue
         if np.hypot(*(b[t + 3] - rest)) < 0.6:
             continue
@@ -79,6 +83,7 @@ def find_restart(f, start, end, lo, hi, centre=None):
             continue
         return t
     return None
+
 
 def compute(f, blocks, tag_prior=None, set_pieces=(), goals=(), params=None, weights=None,
             pitch=None):

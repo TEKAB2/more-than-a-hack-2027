@@ -163,7 +163,30 @@ def _scale(players, ball):
     return players, ball
 
 
-def load_idsse(path):
+MERGE_S = 1.6
+
+
+def merge_brief(labels, seconds):
+    """Hand an opponent spell shorter than `seconds`, sandwiched between two spells of the same
+    team (no dead ball in between), back to that team.
+
+    Why: DFL's BallPossession switches on any touch, so its possessions are much shorter (mean
+    7.3 s, 43 % under 3 s) than Metrica's notion of *controlled* possession. 1.6 s is the value at
+    which the DFL games reproduce the possession statistics of Metrica's own public games (about
+    350 per match, 30 % under 3 s) -- chosen on those other games, never on BAR-ATH.
+    """
+    out = labels.copy()
+    edges = np.flatnonzero(labels[1:] != labels[:-1]) + 1
+    bounds = np.concatenate(([0], edges, [len(labels)]))
+    runs = [(labels[bounds[k]], bounds[k], bounds[k + 1]) for k in range(len(bounds) - 1)]
+    for k in range(1, len(runs) - 1):
+        (a, _, _), (b, lo, hi), (c, _, _) = runs[k - 1], runs[k], runs[k + 1]
+        if b in "HA" and a == c and a in "HA" and a != b and hi - lo < seconds * FPS:
+            out[lo:hi] = a
+    return out
+
+
+def load_idsse(path, merge_s=None):
     """One open Bundesliga match saved by validation.fetch_idsse. Labels straight from the DFL
     corrected tracking (BallStatus, BallPossession) -- the same kind of source as the challenge's
     ground truth. Returns (players, ball), team, blocks, labels, pseudo-events."""
@@ -188,6 +211,8 @@ def load_idsse(path):
             elif last == "D":
                 last = "H"  # unknown owner right after a restart: rare, filled below
             labels[t] = last
+    for _, lo, hi in blocks:
+        labels[lo:hi + 1] = merge_brief(labels[lo:hi + 1], MERGE_S if merge_s is None else merge_s)
     # pseudo-events: one restart per dead->alive transition, for fake_set_piece_tags()
     events = []
     for _, lo, hi in blocks:

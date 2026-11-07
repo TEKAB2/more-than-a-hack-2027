@@ -136,8 +136,18 @@ def team_features(f, blocks, pitch, ball_evidence, variant=None):
         _fill(_win_mean(c, 5, blocks, n), 0.0),
         _fill(_shift_mean(c, -FPS, 0, blocks, n), 0.0),
     ]
-    if variant == "ctrl":
+    if variant in ("ctrl", "touch"):
         cols.append(_fill(_shift_mean(c, 1, FPS, blocks, n), 0.0))
+    if variant == "touch":
+        t1 = f["touch"].astype(np.float64)
+        t2 = f["touch2"].astype(np.float64)
+        cols += [
+            _carry(f["touch"], 2 * FPS, blocks, n),
+            _carry(f["touch2"], 3 * FPS, blocks, n),
+            _carry(f["touch2"], 8 * FPS, blocks, n),
+            _fill(_shift_mean(t1, -FPS, 1, blocks, n), 0.0) * FPS,
+            _fill(_shift_mean(t1, 1, FPS, blocks, n), 0.0) * FPS,
+        ]
     return np.column_stack([base] + cols)
 
 
@@ -188,14 +198,82 @@ def logit(model, X):
 
 def load_weights(path=WEIGHTS):
     with open(path) as handle:
-        return json.load(handle)
+        w = json.load(handle)
+    if w.get("kind") == "gbdt":
+        with open(os.path.join(os.path.dirname(path), w["model_file"])) as handle:
+            models = json.load(handle)
+        w["dead"], w["team"] = models["dead"], models["team"]
+    return w
+
+
+def export_trees(clf):
+    """A fitted scikit-learn HistGradientBoostingClassifier as plain lists, so the pipeline can
+    predict with numpy alone (no scikit-learn, any Python >= 3.8)."""
+    if getattr(clf, "is_categorical_", None) is not None and np.any(clf.is_categorical_):
+        raise ValueError("categorical features are not supported by the numpy predictor")
+    trees = []
+    for (pred,) in clf._predictors:
+        nd = pred.nodes
+        trees.append({
+            "feature": nd["feature_idx"].astype(int).tolist(),
+            "threshold": nd["num_threshold"].astype(float).tolist(),
+            "missing_left": nd["missing_go_to_left"].astype(int).tolist(),
+            "left": nd["left"].astype(int).tolist(),
+            "right": nd["right"].astype(int).tolist(),
+            "leaf": nd["is_leaf"].astype(int).tolist(),
+            "value": nd["value"].astype(float).tolist(),
+        })
+    return {"baseline": float(np.ravel(clf._baseline_prediction)[0]), "trees": trees,
+            "n_features": int(clf.n_features_in_)}
+
+
+def predict_trees(m, X):
+    """Raw score (log-odds) of an exported tree ensemble. Same arithmetic as scikit-learn:
+    go left when x <= threshold, or when x is NaN and missing_left."""
+    X = np.asarray(X, dtype=np.float64)
+    out = np.full(len(X), m["baseline"])
+    rows = np.arange(len(X))
+    for t in m["trees"]:
+        feat, thr = np.asarray(t["feature"]), np.asarray(t["threshold"])
+        left, right = np.asarray(t["left"]), np.asarray(t["right"])
+        leaf, miss = np.asarray(t["leaf"], bool), np.asarray(t["missing_left"], bool)
+        value = np.asarray(t["value"])
+        node = np.zeros(len(X), dtype=np.int64)
+        active = ~leaf[node]
+        while active.any():
+            r, nd = rows[active], node[active]
+            x = X[r, feat[nd]]
+            go_left = np.where(np.isnan(x), miss[nd], x <= thr[nd])
+            node[r] = np.where(go_left, left[nd], right[nd])
+            active = ~leaf[node]
+        out += value[node]
+    return out
+
+
+def fit_gbdt(X, y, seed=0):
+    """Gradient-boosted trees (scikit-learn), fixed seed so the fit is reproducible."""
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    clf = HistGradientBoostingClassifier(max_iter=250, learning_rate=0.08, max_leaf_nodes=31,
+                                         min_samples_leaf=200, l2_regularization=1.0,
+                                         early_stopping=False, random_state=seed)
+    clf.fit(X, y)
+    return clf
+
+
+def logit_any(m, X):
+    if isinstance(m, dict) and "trees" in m:
+        return np.clip(predict_trees(m, X), -9.21, 9.21)   # = log(p/(1-p)) with p in [1e-4, 1-1e-4]
+    if isinstance(m, dict):
+        return logit(m, X)
+    p = np.clip(m.predict_proba(X)[:, 1], 1e-4, 1 - 1e-4)
+    return np.log(p / (1 - p))
 
 
 def emissions(f, blocks, pitch, ball_evidence, weights):
     """(s_team, s_dead) log-odds from the learned models, scaled by the stored temperatures."""
-    s_dead = logit(weights["dead"], dead_features(f, blocks, pitch, weights.get("dead_variant", "v2"))) \
+    s_dead = logit_any(weights["dead"], dead_features(f, blocks, pitch, weights.get("dead_variant", "v2"))) \
         * weights.get("t_dead", 1.0)
-    s_team = logit(weights["team"], team_features(f, blocks, pitch, ball_evidence,
+    s_team = logit_any(weights["team"], team_features(f, blocks, pitch, ball_evidence,
                                                   weights.get("team_variant", "v2"))) \
         * weights.get("t_team", 1.0)
     return s_team.astype(np.float32), s_dead.astype(np.float32)

@@ -28,12 +28,13 @@ from possession import decode, emissions, features, model  # noqa: E402
 from validation import external as E  # noqa: E402
 
 GRID = {
-    "switch": (6.0, 10.0, 15.0),
-    "to_dead": (10.0, 14.0, 20.0),
-    "restart": (10.0, 14.0, 20.0),
-    "t_team": (0.7, 1.0),
-    "t_dead": (0.35, 0.5),
+    "switch": (3.0, 6.0, 10.0, 15.0),
+    "to_dead": (20.0, 28.0, 40.0, 55.0),
+    "restart": (20.0, 28.0, 40.0, 55.0),
+    "t_team": (0.7, 1.0, 1.4),
+    "t_dead": (0.25, 0.35, 0.5),
 }
+TIED = True  # to_dead == restart: halves nothing that matters, quarters the search
 SUBSAMPLE = 4  # every 4th frame for fitting: neighbouring frames are near-duplicates
 
 
@@ -52,6 +53,9 @@ def build(samples, seeds, team_variant, dead_variant):
     return rows
 
 
+LEARNER = "logistic"
+
+
 def fit(rows):
     Xd, yd, Xt, yt = [], [], [], []
     for r in rows:
@@ -62,13 +66,14 @@ def fit(rows):
         alive = graded[np.isin(lab[graded], ["H", "A"])]
         Xt.append(r["Xt"][alive])
         yt.append((lab[alive] == "H").astype(float))
-    return {"dead": model.fit_logistic(np.vstack(Xd), np.concatenate(yd)),
-            "team": model.fit_logistic(np.vstack(Xt), np.concatenate(yt))}
+    learn = model.fit_gbdt if LEARNER == "gbdt" else model.fit_logistic
+    return {"dead": learn(np.vstack(Xd), np.concatenate(yd)),
+            "team": learn(np.vstack(Xt), np.concatenate(yt))}
 
 
 def raw_logits(rows, weights):
     """Model logits per row, before temperatures and restarts (computed once per fold)."""
-    return [(model.logit(weights["team"], r["Xt"]), model.logit(weights["dead"], r["Xd"]))
+    return [(model.logit_any(weights["team"], r["Xt"]), model.logit_any(weights["dead"], r["Xd"]))
             for r in rows]
 
 
@@ -152,11 +157,15 @@ def main():
     parser.add_argument("--out", default=model.WEIGHTS)
     parser.add_argument("--team-variant", default=model.TEAM_VARIANT)
     parser.add_argument("--dead-variant", default="stat")
+    parser.add_argument("--seeds", type=int, default=1)
+    parser.add_argument("--learner", choices=("logistic", "gbdt"), default="logistic")
     args = parser.parse_args()
+    global LEARNER
+    LEARNER = args.learner
 
-    rows = build(args.samples, (0, 1), args.team_variant, args.dead_variant)
+    rows = build(args.samples, tuple(range(args.seeds)), args.team_variant, args.dead_variant)
     names = sorted({r["name"] for r in rows})
-    combos = list(itertools.product(*GRID.values()))
+    combos = [c for c in itertools.product(*GRID.values()) if not TIED or c[1] == c[2]]
     held = {c: [] for c in combos}
     timings = {}
 
@@ -187,9 +196,18 @@ def main():
                    team_variant=args.team_variant, dead_variant=args.dead_variant,
                    costs={k: best[k] for k in ("switch", "to_dead", "restart")},
                    held_out_spell_f1=float(np.mean(held[ranked[0]])),
-                   trained_on="metrica-sports/sample-data games 1-3, degraded, seeds 0-1")
+                   trained_on="metrica-sports/sample-data games 1-3 + IDSSE open Bundesliga "
+                              "matches (validation/external_data), degraded")
+    if LEARNER == "gbdt":
+        model_file = os.path.splitext(os.path.basename(args.out))[0] + "_trees.json"
+        with open(os.path.join(os.path.dirname(os.path.abspath(args.out)), model_file), "w") as h:
+            json.dump({"dead": model.export_trees(weights.pop("dead")),
+                       "team": model.export_trees(weights.pop("team"))}, h)
+        weights.update(kind="gbdt", model_file=model_file)
     with open(args.out, "w") as handle:
         json.dump(weights, handle, indent=1)
+    if LEARNER == "gbdt":
+        weights = model.load_weights(args.out)
     print("final, in-sample:")
     for (name, seed), s in zip([(r["name"], r["seed"]) for r in rows],
                                evaluate(rows, weights, weights["costs"])):
