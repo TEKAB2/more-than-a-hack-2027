@@ -153,13 +153,27 @@ def timing(gt, pred, window=5 * 25):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--samples", required=True)
+    parser.add_argument("--samples", default=os.environ.get("MTAH_SAMPLES"),
+                        help="clone of metrica-sports/sample-data (default: $MTAH_SAMPLES)")
     parser.add_argument("--out", default=model.WEIGHTS)
     parser.add_argument("--team-variant", default=model.TEAM_VARIANT)
     parser.add_argument("--dead-variant", default="stat")
     parser.add_argument("--seeds", type=int, default=1)
     parser.add_argument("--learner", choices=("logistic", "gbdt"), default="logistic")
+    parser.add_argument("--quick", action="store_true",
+                        help="no grid search: reuse the costs and temperatures of the current "
+                             "possession/weights.json (fast comparison of a feature change; "
+                             "does not write any weights)")
     args = parser.parse_args()
+    if not args.samples:
+        parser.error("--samples is required (or set the MTAH_SAMPLES environment variable)")
+    if args.quick:
+        current = model.load_weights()
+        GRID.clear()
+        GRID.update({"switch": (current["costs"]["switch"],),
+                     "to_dead": (current["costs"]["to_dead"],),
+                     "restart": (current["costs"]["restart"],),
+                     "t_team": (current["t_team"],), "t_dead": (current["t_dead"],)})
     global LEARNER
     LEARNER = args.learner
 
@@ -190,6 +204,10 @@ def main():
     t = np.array(timings[ranked[0]], dtype=float)
     print("held-out timing (median over games): team change {:+.2f}s  restart {:+.2f}s  "
           "short possessions found {:.0%}".format(*np.nanmedian(t, axis=0)))
+    if args.quick:
+        print("QUICK held-out spellF1 {:.4f} (costs of the current weights.json; nothing written)"
+              .format(np.mean(held[ranked[0]])))
+        return
 
     weights = fit(rows)
     weights.update(t_team=best["t_team"], t_dead=best["t_dead"],

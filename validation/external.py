@@ -251,48 +251,78 @@ def labels_from_events(events, n_frames, blocks):
 
 
 # --------------------------------------------------------------------------------- degrading
-def degrade(players, ball, rng, ball_missing=0.41, track_missing=0.07, noise=0.25):
-    """Make clean sample tracking look like the automatic ATD.
+# Ball visibility of the ATD, split by state. Measured on BAR-ATH with `possession.diagnose`,
+# grouping frames by OUR OWN predicted labels (algorithmic pseudo-labels, no human label, no
+# ground truth): ball seen on ~87 % of in-play frames and ~27 % of dead-ball frames. Consistent
+# with the published overall figure (59.3 % of graded frames, DATA.md). The first version of this
+# simulator dropped the ball uniformly (41 % everywhere), which hid the strongest dead-ball cue.
+MISSING_ALIVE = 0.13
+MISSING_DEAD = 0.73
+BALL_NOISE = 0.08   # ball drift (m); 0.08 brings the touch rate in play near the ATD's (~65 vs ~43 per min)
 
-    Ball dropouts come in bursts and are more frequent when the ball is crowded or fast -- the
-    frames the ATD loses most (DATA.md). Players get gaps too, and positional jitter.
+
+def _dropouts(mask, target, mean_burst, risk, seed):
+    """Bursts of missing ball inside `mask` only, at a rate giving `target` missing share there."""
+    n = len(mask)
+    edges = np.diff(np.concatenate(([0], mask.astype(np.int8), [0])))
+    run_end = np.zeros(n, dtype=np.int64)
+    for a, b in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+        run_end[a:b] = b
+
+    def draw(p_start):
+        r = np.random.default_rng(seed)
+        lost = np.zeros(n, dtype=bool)
+        starts = mask & (r.random(n) < p_start * risk)
+        lengths = (r.exponential(mean_burst, n) + 1).astype(np.int64)
+        t = 0
+        for t0 in np.flatnonzero(starts):
+            if t0 < t:
+                continue
+            t = min(t0 + lengths[t0], run_end[t0])
+            lost[t0:t] = True
+        return lost
+
+    if not mask.any() or target <= 0:
+        return np.zeros(n, dtype=bool)
+    lo_p, hi_p = 1e-6, 1.0
+    for _ in range(25):
+        mid = (lo_p + hi_p) / 2
+        if draw(mid)[mask].mean() < target:
+            lo_p = mid
+        else:
+            hi_p = mid
+    return draw((lo_p + hi_p) / 2)
+
+
+def degrade(players, ball, rng, labels=None, track_missing=0.07, noise=0.25,
+            ball_noise=None):
+    """Make clean tracking look like the automatic ATD.
+
+    The ball goes missing in bursts, at the ATD's own rates for in-play and dead-ball frames
+    (MISSING_ALIVE / MISSING_DEAD): short bursts in play, more often when the ball is crowded or
+    fast; long bursts during stoppages, when the ball is off camera. Players get gaps and drift.
     """
     n = len(ball)
     ball = fill_ball(ball)
     players = players.copy()
     players[..., :2] += smooth_noise(rng, players[..., :2].shape, noise)
-    ball += smooth_noise(rng, ball.shape, noise)
+    ball += smooth_noise(rng, ball.shape, BALL_NOISE if ball_noise is None else ball_noise)
 
     d = np.hypot(players[:, :, 0] - ball[:, :1], players[:, :, 1] - ball[:, 1:2])
     crowded = (np.nan_to_num(d, nan=99) < 3).sum(axis=1) >= 3
     speed = np.zeros(n)
     speed[1:] = np.hypot(*(ball[1:] - ball[:-1]).T) * FPS
     risk = 1.0 + 1.5 * crowded + 1.0 * (np.nan_to_num(speed) > 15)
-    mean_burst = 30
 
-    def dropouts(p_start, seed):
-        r = np.random.default_rng(seed)
-        lost = np.zeros(n, dtype=bool)
-        starts = r.random(n) < p_start * risk
-        lengths = (r.exponential(mean_burst, n) + 1).astype(int)
-        t = 0
-        for t0 in np.flatnonzero(starts):
-            if t0 < t:
-                continue
-            lost[t0:t0 + lengths[t0]] = True
-            t = t0 + lengths[t0]
-        return lost
-
-    # Bisection on the burst rate so the overall missing share matches the ATD's.
+    if labels is None:
+        alive = np.ones(n, dtype=bool)
+        dead = np.zeros(n, dtype=bool)
+    else:
+        alive = np.isin(labels, ["H", "A"])
+        dead = labels == "D"
     seed = int(rng.integers(1 << 30))
-    lo_p, hi_p = 1e-5, 0.2
-    for _ in range(25):
-        mid = (lo_p + hi_p) / 2
-        if dropouts(mid, seed).mean() < ball_missing:
-            lo_p = mid
-        else:
-            hi_p = mid
-    lost = dropouts((lo_p + hi_p) / 2, seed)
+    lost = _dropouts(alive, MISSING_ALIVE, 12, risk, seed)
+    lost |= _dropouts(dead, MISSING_DEAD, 5 * FPS, np.ones(n), seed + 1)
     ball[lost] = np.nan
 
     n_slots = players.shape[1]
@@ -366,7 +396,8 @@ def _fake_tags(events, rng, miss, jitter):
 
 
 # ----------------------------------------------------------------------------------- running
-IDSSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "external_data")
+IDSSE_DIR = os.environ.get("MTAH_EXTERNAL_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "external_data")
 
 
 def prepare(samples_dir, seed=0, idsse_dir=IDSSE_DIR):
@@ -395,7 +426,7 @@ def prepare(samples_dir, seed=0, idsse_dir=IDSSE_DIR):
         if labels is None:
             labels = labels_from_events(events, len(ball), blocks)
         mark_openings(events, blocks)
-        players, ball = degrade(players, ball, rng)
+        players, ball = degrade(players, ball, rng, labels)
         atd = {"players": speeds(players), "ball": ball, "team": team}
         out.append((name, atd, blocks, labels, events))
     return out

@@ -1,0 +1,14 @@
+# Licensed match data and anything derived from it: no AI access (terms of use forbid giving
+# the videos, data or extracts to a hosted LLM). Cursor also skips .gitignore'd files, but say it
+# explicitly. NB: this does not block the terminal -- see .cursor/rules/00-garde-fous.mdc.
+data/
+cache/
+*.mp4
+*_atd.txt
+*_atd.xml
+*_homography.csv
+*_smart_tagging.xml
+viewer_pack.bin
+# large binary/open data: not useful to read as text
+validation/external_data/
+.venv/

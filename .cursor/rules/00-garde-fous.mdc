@@ -1,0 +1,25 @@
+---
+description: Non-negotiable rules of the More than a Hack 2027 challenge (data access, labels, tuning, reproducibility)
+alwaysApply: true
+---
+
+Read `AGENTS.md` at the start of every task. Answer the user in French.
+
+Hard rules (one violation can disqualify the team; when in doubt, stop and ask):
+
+1. NEVER read, print, cat, head, grep, open, plot or summarise frame-level content of `data/`,
+   `cache/`, `*.mp4`, `*_atd.*`, `*_homography.csv`, `*_smart_tagging.xml` or
+   `cache/viewer_pack.bin` -- not with tools, not in the terminal. You are a hosted LLM and the
+   terms of use forbid giving it the match data or extracts. Only aggregate outputs (scores,
+   counts, means, e.g. `python -m possession.diagnose`) may enter the conversation. To understand
+   the match, ask the human to look in `tools/viewer.html`.
+2. No human label of the provided match in any amount, and no rule or constant tied to specific
+   frames of it. Labels come out of an algorithm.
+3. Never tune or choose between versions using the public 5-minute ground truth
+   (`evaluation/gt/*_public.csv`): it is for checking the pipeline only. Choose with the bench
+   (`python -m validation.train ... --quick`, see AGENTS.md section 4).
+4. No human-produced data about this match from any source (Opta, StatsBomb, ...).
+5. Determinism: same inputs -> byte-identical `submissions/TercerHombre.csv`. No unseeded
+   randomness, no network at inference, no pickles. Inference uses numpy + pandas only and must
+   run on Python 3.9.
+6. Never commit `data/`, `cache/`, `submissions/`, `validation/external_data/`, `.venv/`.

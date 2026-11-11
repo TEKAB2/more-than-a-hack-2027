@@ -55,8 +55,12 @@ No label of the provided game is used, in any amount.
   Frame labels are derived from the events: an on-ball event (set piece, pass, carry, recovery,
   shot) gives possession to its team; a ball out, a shot out or in goal, or a foul starts a dead
   ball that lasts until the next on-ball event.
-* All tracking is **degraded to resemble the ATD**: ball missing on 41 % of frames in bursts,
-  more often when the ball is crowded or fast; low-frequency positional error; player track gaps.
+* All tracking is **degraded to resemble the ATD**. Ball visibility depends on the state of play,
+  as in the ATD: missing on ~13 % of in-play frames (short bursts, more often when the ball is
+  crowded or fast) and ~73 % of dead-ball frames (long bursts, ball off camera). These two rates
+  were measured on BAR-ATH by `possession/diagnose.py`, grouping frames by our own predicted
+  labels (algorithmic pseudo-labels, no ground truth), and agree with the published overall
+  figure (59.3 % of graded frames seen). Plus low-frequency positional error and track gaps.
   Restarts are given to the model as noisy pseudo-tags (jittered, often missing, throw-ins
   without a team), like the Smart Tagging.
 * Emission models: gradient-boosted trees (scikit-learn `HistGradientBoostingClassifier`, fixed
@@ -70,10 +74,19 @@ No label of the provided game is used, in any amount.
 | official baseline (±2 s window) | 0.239 | — | — |
 | logistic, proximity + control features | 0.533 | +0.09 s | 9 % |
 | logistic, + touch detection | 0.543 | +0.08 s | 14 % |
-| **boosted trees, + touch detection** | **0.564** | +0.04 s | 19 % |
+| boosted trees, + touch detection | 0.564 | +0.04 s | 19 % |
 
-The baseline scores 0.239 here and 0.2433 on BAR-ATH, which suggests the protocol is a fair proxy
-for the difficulty of the real task.
+With the state-dependent ball visibility (v5 bench, more faithful to the ATD):
+
+| held out, 10 games | spellF1 | delay of a change of team | short possessions found |
+|---|---|---|---|
+| official baseline (±2 s window) | 0.283 | — | — |
+| v4 model (trained on the previous bench) | 0.618 * | — | — |
+| **v5: same model retrained on this bench** | **0.641** | −0.04 s | 28 % |
+
+\* not held out: v4 was fitted on these games. The baseline scores 0.283 on this bench against
+0.2433 on BAR-ATH, so this bench is somewhat easier than the real task; it ranks versions, it does
+not predict the final score.
 
 **Touch detection** (`features.detect_touches`, after Link & Hoernig, *PLoS ONE* 2017, and
 ELASTIC, Kim et al., 2025): a local peak of the ball's acceleration (≥ 10 m/s²) or a sharp change
