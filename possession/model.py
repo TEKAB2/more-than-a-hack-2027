@@ -136,9 +136,9 @@ def team_features(f, blocks, pitch, ball_evidence, variant=None):
         _fill(_win_mean(c, 5, blocks, n), 0.0),
         _fill(_shift_mean(c, -FPS, 0, blocks, n), 0.0),
     ]
-    if variant in ("ctrl", "touch"):
+    if variant in ("ctrl", "touch", "duel", "duel_past"):
         cols.append(_fill(_shift_mean(c, 1, FPS, blocks, n), 0.0))
-    if variant == "touch":
+    if variant in ("touch", "duel", "duel_past"):
         t1 = f["touch"].astype(np.float64)
         t2 = f["touch2"].astype(np.float64)
         cols += [
@@ -148,7 +148,104 @@ def team_features(f, blocks, pitch, ball_evidence, variant=None):
             _fill(_shift_mean(t1, -FPS, 1, blocks, n), 0.0) * FPS,
             _fill(_shift_mean(t1, 1, FPS, blocks, n), 0.0) * FPS,
         ]
+    if variant == "duel":
+        cols += _duel_features(f, blocks, n)
+    elif variant == "duel_past":
+        # same, without the three indices that look at the NEXT touch (team, delay, streak):
+        # looking ahead can make the decoder switch before the ball is actually won.
+        # The positions 2, 3, 5 follow the order of the list returned by _duel_features.
+        duel = _duel_features(f, blocks, n)
+        cols += [col for k, col in enumerate(duel) if k not in (2, 3, 5)]
     return np.column_stack([base] + cols)
+
+
+DUEL_HORIZON_S = 8.0     # a touch older (or further ahead) than this says nothing about now
+DUEL_STREAK_GAP_S = 4.0  # same rule as touch2: two touches of one team more than 4 s apart
+#                          are not one sequence
+
+
+def _event_index(event, blocks, forward=False):
+    """Frame index of the last True at or before each frame (or, with `forward`, of the first
+    True strictly after it), inside each block; -1 when there is none."""
+    out = np.full(len(event), -1, dtype=np.int64)
+    for _, lo, hi in blocks:
+        seg = event[lo:hi + 1]
+        m = len(seg)
+        i = np.arange(m)
+        if forward:
+            at_or_after = np.minimum.accumulate(np.where(seg, i, m)[::-1])[::-1]
+            nxt = np.concatenate((at_or_after[1:], [m]))
+            out[lo:hi + 1] = np.where(nxt < m, nxt + lo, -1)
+        else:
+            last = np.maximum.accumulate(np.where(seg, i, -1))
+            out[lo:hi + 1] = np.where(last >= 0, last + lo, -1)
+    return out
+
+
+def _duel_features(f, blocks, n):
+    """Indices that tell a recovery from a mere contact in a duel.
+
+    A short possession starts with a touch by the other team. What separates a real recovery from
+    a deflection is what surrounds that touch: was it followed by a second touch of the same team
+    (streak), how crowded was the ball (duel or free reception), and where did the ball go next
+    (forward for the team that touched it, or straight back). All signed home = +, away = -.
+    """
+    touch = f["touch"].astype(np.float64)
+    is_touch = touch != 0
+    t = np.arange(n)
+
+    # run length of consecutive touches by one team, signed, written on the touch frames
+    streak = np.zeros(n)
+    max_gap = DUEL_STREAK_GAP_S * FPS
+    for _, lo, hi in blocks:
+        last_sign, last_t, run = 0.0, -10 ** 9, 0
+        for i in np.flatnonzero(is_touch[lo:hi + 1]) + lo:
+            run = run + 1 if (touch[i] == last_sign and i - last_t < max_gap) else 1
+            streak[i] = touch[i] * min(run, 4)
+            last_sign, last_t = touch[i], i
+
+    def around(event):
+        last, nxt = _event_index(event, blocks), _event_index(event, blocks, forward=True)
+        age_last = np.where(last >= 0, (t - last) / float(FPS), DUEL_HORIZON_S)
+        age_next = np.where(nxt >= 0, (nxt - t) / float(FPS), DUEL_HORIZON_S)
+        ok_last = age_last < DUEL_HORIZON_S
+        ok_next = age_next < DUEL_HORIZON_S
+        return (np.maximum(last, 0), ok_last, np.minimum(age_last, DUEL_HORIZON_S),
+                np.maximum(nxt, 0), ok_next, np.minimum(age_next, DUEL_HORIZON_S))
+
+    li, ok_l, age_l, ni, ok_n, age_n = around(is_touch)
+    _, _, age_home, _, _, _ = around(touch > 0)
+    _, _, age_away, _, _, _ = around(touch < 0)
+
+    # crowd around the ball: signed balance and how contested it is (both teams close)
+    nh, na = f["n_home_near"].astype(np.float64), f["n_away_near"].astype(np.float64)
+    balance = nh - na
+    contested = np.where(f["ball_ok"], np.minimum(nh, na), np.nan)
+
+    # where the ball goes in the 0.6 s after a frame, towards the away goal = +, and how fast
+    ahead = 15
+    forward = np.full(n, np.nan)
+    for _, lo, hi in blocks:
+        x = f["ball"][lo:hi + 1, 0].astype(np.float64)
+        if len(x) > ahead:
+            forward[lo:hi + 1 - ahead] = (x[ahead:] - x[:-ahead]) \
+                * f["attack_sign_home"][lo:hi + 1 - ahead]
+    speed = np.where(f["ball_seen"], f["ball_speed"], np.nan).astype(np.float64)
+    speed_after = _shift_mean(speed, 1, 11, blocks, n)
+
+    return [
+        np.where(ok_l, touch[li], 0.0),                    # team of the last touch
+        age_l,
+        np.where(ok_n, touch[ni], 0.0),                    # team of the next touch
+        age_n,
+        np.where(ok_l, streak[li], 0.0),                   # 1 = lone contact, 2+ = sequence
+        np.where(ok_n, streak[ni], 0.0),                   # does the next touch extend it?
+        age_away - age_home,                               # > 0: home touched more recently
+        np.where(ok_l, balance[li], 0.0),                  # crowd balance at the last touch
+        _fill(_win_mean(contested, FPS // 2, blocks, n), 0.0),
+        np.where(ok_l, _fill(forward[li], 0.0), 0.0),      # ball direction after the last touch
+        np.log1p(np.where(ok_l, _fill(speed_after[li], 5.0), 5.0)),
+    ]
 
 
 def _team_v2(f, blocks, pitch, ball_evidence):

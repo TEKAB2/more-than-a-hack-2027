@@ -28,7 +28,7 @@ from possession import decode, emissions, features, model  # noqa: E402
 from validation import external as E  # noqa: E402
 
 GRID = {
-    "switch": (6.0, 10.0, 15.0),
+    "switch": (10.0, 15.0, 22.0, 30.0),   # the possession-weighted team model needs 22-30
     "to_dead": (28.0, 40.0, 55.0, 75.0),
     "restart": (28.0, 40.0, 55.0, 75.0),
     "t_team": (0.7, 1.0, 1.4),
@@ -112,8 +112,32 @@ def evaluate(rows, weights, costs, logits=None):
         res = pm.evaluate(pm.label_codes(r["labels"]), pm.label_codes(pred), bootstrap_n=0)
         scores.append((res["spell_f1_mean"], res["macro_f1"], res["n_gt_spells"],
                         res["n_pred_spells"]) + timing(r["labels"], pred)
-                      + (res["spell_f1"][pm.SPELL_IOU_HEADLINE]["n_spurious"],))
+                      + (res["spell_f1"][pm.SPELL_IOU_HEADLINE]["n_spurious"],)
+                      + team_change_hits(r["labels"], pred))
     return scores
+
+
+CHANGE_TOLS = (12, 25)   # frames: +/- 0.5 s and +/- 1 s, the tolerances of the official transF1
+
+
+def team_change_hits(gt, pred):
+    """(true team changes, predicted team changes, matched within 0.5 s, matched within 1 s).
+
+    Only H <-> A changes, matched one to one on the destination team with the official matcher.
+    Replaces the median delay, which is the same one frame whatever the model: these counts drop
+    when changes are fired too early or too late.
+    """
+    gt_codes, pred_codes = pm.label_codes(gt), pm.label_codes(pred)
+    runs = pm.valid_runs(gt_codes)
+    filled = pm.fill_abstentions(pred_codes, runs)
+    alive = (pm.H, pm.A)
+
+    def team_changes(codes):
+        return [c for c in pm.transitions(codes, runs) if c[1] in alive and c[2] in alive]
+
+    g, p = team_changes(gt_codes), team_changes(filled)
+    return (len(g), len(p)) + tuple(len(pm.match_transitions(g, p, tol)[0])
+                                    for tol in CHANGE_TOLS)
 
 
 def _changes(labels):
@@ -188,9 +212,13 @@ def main():
                              "possession/weights.json (fast comparison of a feature change; "
                              "does not write any weights)")
     parser.add_argument("--mini-grid", action="store_true",
-                        help="like --quick, but also searches switch {10, 15, 22} x t_team "
-                             "{1.0, 1.4, 2.0} (dead-ball costs unchanged); prints every "
-                             "setting, writes nothing")
+                        help="like --quick, but also searches --grid-switch x --grid-t-team "
+                             "(dead-ball costs unchanged); prints every setting, writes "
+                             "nothing")
+    parser.add_argument("--grid-switch", default="10,15,22",
+                        help="switch costs searched by --mini-grid (comma-separated)")
+    parser.add_argument("--grid-t-team", default="1.0,1.4,2.0",
+                        help="team temperatures searched by --mini-grid (comma-separated)")
     parser.add_argument("--no-spell-weight", action="store_true",
                         help="fit the team model without the per-possession frame weights")
     args = parser.parse_args()
@@ -204,7 +232,8 @@ def main():
                      "restart": (current["costs"]["restart"],),
                      "t_team": (current["t_team"],), "t_dead": (current["t_dead"],)})
     if args.mini_grid:
-        GRID.update({"switch": (10.0, 15.0, 22.0), "t_team": (1.0, 1.4, 2.0)})
+        GRID.update({"switch": tuple(float(v) for v in args.grid_switch.split(",")),
+                     "t_team": tuple(float(v) for v in args.grid_t_team.split(","))})
     global LEARNER, SPELL_WEIGHT
     LEARNER = args.learner
     SPELL_WEIGHT = not args.no_spell_weight
@@ -215,6 +244,8 @@ def main():
     held = {c: [] for c in combos}
     timings = {}
     counts = {c: [] for c in combos}
+    by_source = {c: {"metrica": [], "dfl": []} for c in combos}
+    changes = {c: [] for c in combos}
 
     for name in names:
         train = [r for r in rows if r["name"] != name]
@@ -229,16 +260,28 @@ def main():
             held[c] += [s[0] for s in res]
             timings.setdefault(c, []).extend(s[4:7] for s in res)
             counts[c] += [(s[2], s[3], s[7]) for s in res]
+            changes[c] += [s[8:12] for s in res]
+            # the two label conventions differ (Metrica: controlled possession, DFL: per touch)
+            source = "metrica" if name.startswith("sample") else "dfl"
+            by_source[c][source] += [s[0] for s in res]
         print("fold {} done".format(name))
 
     ranked = sorted(combos, key=lambda c: -np.mean(held[c]))
     for c in (ranked if args.mini_grid else ranked[:5]):
         gt_n, pred_n, spurious = np.sum(counts[c], axis=0)
         tc = np.nanmedian(np.array(timings[c], dtype=float), axis=0)
+        n_true, n_fired, hit_half, hit_one = np.sum(changes[c], axis=0)
         print("held-out spellF1 {:.4f}  {}  possessions gt {} pred {} spurious@{} {}  "
-              "team change {:+.2f}s  short found {:.0%}".format(
+              "short found {:.0%}".format(
                   np.mean(held[c]), dict(zip(GRID, c)), int(gt_n), int(pred_n),
-                  pm.SPELL_IOU_HEADLINE, int(spurious), tc[0], tc[2]))
+                  pm.SPELL_IOU_HEADLINE, int(spurious), tc[2]))
+        print("    team changes gt {} pred {}: found within 0.5 s {:.1%}, within 1 s {:.1%} "
+              "(of predicted: {:.1%}, {:.1%})".format(
+                  int(n_true), int(n_fired), hit_half / max(n_true, 1), hit_one / max(n_true, 1),
+                  hit_half / max(n_fired, 1), hit_one / max(n_fired, 1)))
+        print("    by label source: " + "  ".join(
+            "{} {:.4f} ({} games)".format(k, np.mean(v), len(v))
+            for k, v in by_source[c].items() if v))
     best = dict(zip(GRID, ranked[0]))
     t = np.array(timings[ranked[0]], dtype=float)
     print("held-out timing (median over games): team change {:+.2f}s  restart {:+.2f}s  "
