@@ -1,14 +1,14 @@
 {
- "t_team": 1.0,
- "t_dead": 0.5,
+ "t_team": 1.4,
+ "t_dead": 0.7,
  "team_variant": "touch",
  "dead_variant": "stat",
  "costs": {
-  "switch": 10.0,
+  "switch": 15.0,
   "to_dead": 55.0,
   "restart": 55.0
  },
- "held_out_spell_f1": 0.6410912098175372,
+ "held_out_spell_f1": 0.6136138497857863,
  "trained_on": "metrica-sports/sample-data games 1-3 + IDSSE open Bundesliga matches (validation/external_data), degraded",
  "kind": "gbdt",
  "model_file": "weights_trees.json",

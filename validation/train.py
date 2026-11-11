@@ -28,11 +28,11 @@ from possession import decode, emissions, features, model  # noqa: E402
 from validation import external as E  # noqa: E402
 
 GRID = {
-    "switch": (3.0, 6.0, 10.0, 15.0),
-    "to_dead": (20.0, 28.0, 40.0, 55.0),
-    "restart": (20.0, 28.0, 40.0, 55.0),
+    "switch": (6.0, 10.0, 15.0),
+    "to_dead": (28.0, 40.0, 55.0, 75.0),
+    "restart": (28.0, 40.0, 55.0, 75.0),
     "t_team": (0.7, 1.0, 1.4),
-    "t_dead": (0.25, 0.35, 0.5),
+    "t_dead": (0.35, 0.5, 0.7),
 }
 TIED = True  # to_dead == restart: halves nothing that matters, quarters the search
 SUBSAMPLE = 4  # every 4th frame for fitting: neighbouring frames are near-duplicates

@@ -57,7 +57,9 @@ No label of the provided game is used, in any amount.
   ball that lasts until the next on-ball event.
 * All tracking is **degraded to resemble the ATD**. Ball visibility depends on the state of play,
   as in the ATD: missing on ~13 % of in-play frames (short bursts, more often when the ball is
-  crowded or fast) and ~73 % of dead-ball frames (long bursts, ball off camera). These two rates
+  crowded or fast) and ~73 % of dead-ball frames (long bursts, ball off camera). In play the
+  ball is lost rarely but for seconds at a time (≥ 1 s, mean ≈ 5 s): the ATD's 168 gaps have a
+  median of 9.6 s and short losses are almost absent, as the ATD bridges them itself. These two rates
   were measured on BAR-ATH by `possession/diagnose.py`, grouping frames by our own predicted
   labels (algorithmic pseudo-labels, no ground truth), and agree with the published overall
   figure (59.3 % of graded frames seen). Plus low-frequency positional error and track gaps.
@@ -84,7 +86,18 @@ With the state-dependent ball visibility (v5 bench, more faithful to the ATD):
 | v4 model (trained on the previous bench) | 0.618 * | — | — |
 | **v5: same model retrained on this bench** | **0.641** | −0.04 s | 28 % |
 
-\* not held out: v4 was fitted on these games. The baseline scores 0.283 on this bench against
+\* not held out: v4 was fitted on these games.
+
+With long in-play gaps as in the ATD (v6 bench; the baseline scores 0.257 here against 0.2433 on
+BAR-ATH, the closest calibration so far):
+
+| held out on the v6 bench, 10 games | spellF1 |
+|---|---|
+| official baseline (±2 s window) | 0.257 |
+| model fitted on the v5 simulator (short in-play gaps) | 0.591 |
+| **v6: model fitted on the v6 simulator** | **0.614** (better on all 10 games) |
+
+ The baseline scores 0.283 on this bench against
 0.2433 on BAR-ATH, so this bench is somewhat easier than the real task; it ranks versions, it does
 not predict the final score.
 

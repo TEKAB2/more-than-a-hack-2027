@@ -261,7 +261,14 @@ MISSING_DEAD = 0.73
 BALL_NOISE = 0.08   # ball drift (m); 0.08 brings the touch rate in play near the ATD's (~65 vs ~43 per min)
 
 
-def _dropouts(mask, target, mean_burst, risk, seed):
+# Gap structure of the ATD (measured on BAR-ATH from aggregates only, 168 gaps): gaps are LONG
+# (median 9.6 s, p10 0.9 s) and short losses are almost absent -- the ATD bridges them itself.
+# So in play the ball vanishes rarely but for seconds at a time, not in frequent short bursts.
+ALIVE_GAP_MIN = 1 * FPS
+ALIVE_GAP_MEAN = 5 * FPS
+
+
+def _dropouts(mask, target, mean_burst, risk, seed, min_burst=1):
     """Bursts of missing ball inside `mask` only, at a rate giving `target` missing share there."""
     n = len(mask)
     edges = np.diff(np.concatenate(([0], mask.astype(np.int8), [0])))
@@ -273,7 +280,7 @@ def _dropouts(mask, target, mean_burst, risk, seed):
         r = np.random.default_rng(seed)
         lost = np.zeros(n, dtype=bool)
         starts = mask & (r.random(n) < p_start * risk)
-        lengths = (r.exponential(mean_burst, n) + 1).astype(np.int64)
+        lengths = (r.exponential(mean_burst, n) + min_burst).astype(np.int64)
         t = 0
         for t0 in np.flatnonzero(starts):
             if t0 < t:
@@ -321,7 +328,7 @@ def degrade(players, ball, rng, labels=None, track_missing=0.07, noise=0.25,
         alive = np.isin(labels, ["H", "A"])
         dead = labels == "D"
     seed = int(rng.integers(1 << 30))
-    lost = _dropouts(alive, MISSING_ALIVE, 12, risk, seed)
+    lost = _dropouts(alive, MISSING_ALIVE, ALIVE_GAP_MEAN, risk, seed, ALIVE_GAP_MIN)
     lost |= _dropouts(dead, MISSING_DEAD, 5 * FPS, np.ones(n), seed + 1)
     ball[lost] = np.nan
 

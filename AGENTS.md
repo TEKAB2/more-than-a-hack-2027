@@ -117,14 +117,20 @@ Sous-agents Cursor disponibles (`.cursor/agents/`) : `/evaluateur`, `/auditeur-r
 
 ---
 
-## 5. État actuel (v5)
+## 5. État actuel (v6, 11 novembre)
 
-| banc v5, 10 matchs exclus | spellF1 |
+Le banc d'essai a été rendu plus réaliste (fiche D) : pendant le jeu, le ballon disparaît
+rarement mais plusieurs secondes d'affilée, comme dans l'ATD. **Les chiffres ne se comparent
+qu'à l'intérieur d'une même version du banc.**
+
+| banc v6, 10 matchs exclus | spellF1 |
 |---|---|
-| baseline officielle | 0,283 (0,2433 sur le vrai match : ce banc est un peu plus facile) |
-| v5 | **0,641**, possessions courtes retrouvées 28 %, délai médian −0,04 s |
+| baseline officielle | 0,257 (0,2433 sur le vrai match : meilleur calibrage à ce jour) |
+| modèle entraîné sur l'ancien simulateur (v5) | 0,591 |
+| **v6** | **0,614**, possessions courtes retrouvées 26 % |
 
-5 minutes publiques (v4, indicatif) : spellF1 0,537, 18 possessions prédites pour 17 vraies.
+Référence pour `/evaluateur` à partir de maintenant : `--quick` sur le banc v6 (rebaser la branche
+sur main avant de mesurer).
 
 Faiblesses connues, par gain attendu :
 1. **Possessions courtes** (< 3 s, ~30 % des possessions) : seulement 28 % retrouvées. Les
