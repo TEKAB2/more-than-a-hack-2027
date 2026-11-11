@@ -173,17 +173,18 @@ def _team_v2(f, blocks, pitch, ball_evidence):
 
 
 # ------------------------------------------------------------------------- logistic regression
-def fit_logistic(X, y, l2=1.0, iters=30):
+def fit_logistic(X, y, l2=1.0, iters=30, sample_weight=None):
     """IRLS with L2; features standardised internally. Deterministic."""
     mu, sd = X.mean(axis=0), X.std(axis=0) + 1e-9
     Z = np.column_stack([np.ones(len(X)), (X - mu) / sd])
     w = np.zeros(Z.shape[1])
     reg = np.eye(Z.shape[1]) * l2
     reg[0, 0] = 0.0
+    sw = np.ones(len(X)) if sample_weight is None else np.asarray(sample_weight, dtype=np.float64)
     for _ in range(iters):
         p = 1.0 / (1.0 + np.exp(-np.clip(Z @ w, -30, 30)))
-        g = Z.T @ (p - y) + reg @ w
-        Hm = (Z * (p * (1 - p))[:, None]).T @ Z + reg
+        g = Z.T @ (sw * (p - y)) + reg @ w
+        Hm = (Z * (sw * p * (1 - p))[:, None]).T @ Z + reg
         step = np.linalg.solve(Hm, g)
         w -= step
         if np.abs(step).max() < 1e-6:
@@ -250,13 +251,13 @@ def predict_trees(m, X):
     return out
 
 
-def fit_gbdt(X, y, seed=0):
+def fit_gbdt(X, y, seed=0, sample_weight=None):
     """Gradient-boosted trees (scikit-learn), fixed seed so the fit is reproducible."""
     from sklearn.ensemble import HistGradientBoostingClassifier
     clf = HistGradientBoostingClassifier(max_iter=250, learning_rate=0.08, max_leaf_nodes=31,
                                          min_samples_leaf=200, l2_regularization=1.0,
                                          early_stopping=False, random_state=seed)
-    clf.fit(X, y)
+    clf.fit(X, y, sample_weight=sample_weight)
     return clf
 
 

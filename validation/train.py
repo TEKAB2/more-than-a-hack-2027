@@ -55,9 +55,26 @@ def build(samples, seeds, team_variant, dead_variant):
 
 LEARNER = "logistic"
 
+# Team model only: spellF1 counts every possession once, but a per-frame loss counts a 20 s
+# possession 20 times more than a 1 s one. Weight each frame by ref / (length of its possession),
+# capped. Both constants are fixed a priori, not tuned on the bench.
+SPELL_WEIGHT = True
+SPELL_REF_S = 5.0
+SPELL_CAP = 5.0
+
+
+def spell_weights(labels):
+    """Per-frame weight min(SPELL_CAP, SPELL_REF_S / duration of the frame's label run)."""
+    n = len(labels)
+    change = np.flatnonzero(labels[1:] != labels[:-1]) + 1
+    starts = np.concatenate(([0], change))
+    ends = np.concatenate((change, [n]))
+    dur = np.repeat((ends - starts) / float(model.FPS), ends - starts)
+    return np.minimum(SPELL_CAP, SPELL_REF_S / dur)
+
 
 def fit(rows):
-    Xd, yd, Xt, yt = [], [], [], []
+    Xd, yd, Xt, yt, wt = [], [], [], [], []
     for r in rows:
         lab = r["labels"]
         graded = np.flatnonzero(lab != "X")[::SUBSAMPLE]
@@ -66,9 +83,14 @@ def fit(rows):
         alive = graded[np.isin(lab[graded], ["H", "A"])]
         Xt.append(r["Xt"][alive])
         yt.append((lab[alive] == "H").astype(float))
+        wt.append(spell_weights(lab)[alive])
     learn = model.fit_gbdt if LEARNER == "gbdt" else model.fit_logistic
+    w = None
+    if SPELL_WEIGHT:
+        w = np.concatenate(wt)
+        w = w / w.mean()          # mean 1: the L2 term keeps the same relative strength
     return {"dead": learn(np.vstack(Xd), np.concatenate(yd)),
-            "team": learn(np.vstack(Xt), np.concatenate(yt))}
+            "team": learn(np.vstack(Xt), np.concatenate(yt), sample_weight=w)}
 
 
 def raw_logits(rows, weights):
@@ -89,7 +111,8 @@ def evaluate(rows, weights, costs, logits=None):
         pred = decode.decode(s_team, s_dead, r["blocks"], len(r["labels"]), costs)
         res = pm.evaluate(pm.label_codes(r["labels"]), pm.label_codes(pred), bootstrap_n=0)
         scores.append((res["spell_f1_mean"], res["macro_f1"], res["n_gt_spells"],
-                        res["n_pred_spells"]) + timing(r["labels"], pred))
+                        res["n_pred_spells"]) + timing(r["labels"], pred)
+                      + (res["spell_f1"][pm.SPELL_IOU_HEADLINE]["n_spurious"],))
     return scores
 
 
@@ -164,24 +187,34 @@ def main():
                         help="no grid search: reuse the costs and temperatures of the current "
                              "possession/weights.json (fast comparison of a feature change; "
                              "does not write any weights)")
+    parser.add_argument("--mini-grid", action="store_true",
+                        help="like --quick, but also searches switch {10, 15, 22} x t_team "
+                             "{1.0, 1.4, 2.0} (dead-ball costs unchanged); prints every "
+                             "setting, writes nothing")
+    parser.add_argument("--no-spell-weight", action="store_true",
+                        help="fit the team model without the per-possession frame weights")
     args = parser.parse_args()
     if not args.samples:
         parser.error("--samples is required (or set the MTAH_SAMPLES environment variable)")
-    if args.quick:
+    if args.quick or args.mini_grid:
         current = model.load_weights()
         GRID.clear()
         GRID.update({"switch": (current["costs"]["switch"],),
                      "to_dead": (current["costs"]["to_dead"],),
                      "restart": (current["costs"]["restart"],),
                      "t_team": (current["t_team"],), "t_dead": (current["t_dead"],)})
-    global LEARNER
+    if args.mini_grid:
+        GRID.update({"switch": (10.0, 15.0, 22.0), "t_team": (1.0, 1.4, 2.0)})
+    global LEARNER, SPELL_WEIGHT
     LEARNER = args.learner
+    SPELL_WEIGHT = not args.no_spell_weight
 
     rows = build(args.samples, tuple(range(args.seeds)), args.team_variant, args.dead_variant)
     names = sorted({r["name"] for r in rows})
     combos = [c for c in itertools.product(*GRID.values()) if not TIED or c[1] == c[2]]
     held = {c: [] for c in combos}
     timings = {}
+    counts = {c: [] for c in combos}
 
     for name in names:
         train = [r for r in rows if r["name"] != name]
@@ -194,16 +227,25 @@ def main():
             costs = {k: setting[k] for k in ("switch", "to_dead", "restart")}
             res = evaluate(test, w, costs, logits)
             held[c] += [s[0] for s in res]
-            timings.setdefault(c, []).extend(s[4:] for s in res)
+            timings.setdefault(c, []).extend(s[4:7] for s in res)
+            counts[c] += [(s[2], s[3], s[7]) for s in res]
         print("fold {} done".format(name))
 
     ranked = sorted(combos, key=lambda c: -np.mean(held[c]))
-    for c in ranked[:5]:
-        print("held-out spellF1 {:.4f}  {}".format(np.mean(held[c]), dict(zip(GRID, c))))
+    for c in (ranked if args.mini_grid else ranked[:5]):
+        gt_n, pred_n, spurious = np.sum(counts[c], axis=0)
+        tc = np.nanmedian(np.array(timings[c], dtype=float), axis=0)
+        print("held-out spellF1 {:.4f}  {}  possessions gt {} pred {} spurious@{} {}  "
+              "team change {:+.2f}s  short found {:.0%}".format(
+                  np.mean(held[c]), dict(zip(GRID, c)), int(gt_n), int(pred_n),
+                  pm.SPELL_IOU_HEADLINE, int(spurious), tc[0], tc[2]))
     best = dict(zip(GRID, ranked[0]))
     t = np.array(timings[ranked[0]], dtype=float)
     print("held-out timing (median over games): team change {:+.2f}s  restart {:+.2f}s  "
           "short possessions found {:.0%}".format(*np.nanmedian(t, axis=0)))
+    if args.mini_grid:
+        print("MINI-GRID done (nothing written)")
+        return
     if args.quick:
         print("QUICK held-out spellF1 {:.4f} (costs of the current weights.json; nothing written)"
               .format(np.mean(held[ranked[0]])))
