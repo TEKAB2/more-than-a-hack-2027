@@ -434,35 +434,41 @@ def _forward_stage(x, params, prefix, dilations):
 def forward_block_numpy(X_block, params):
     """Run the 2-stage MS-TCN on a single contiguous half block.
     X_block: (T, C_in) float32
-    Returns (stage1_logits, stage2_logits), each (T, 5) float32:
-      cols = [logit_H, logit_A, logit_D, logit_change, logit_dead_edge]
+    Returns (stage1_logits, stage2_logits), each (T, 5) or (T, 6) float32:
+      cols = [logit_H, logit_A, logit_D, logit_change, logit_dead_edge(, raw_offset)]
     """
     mu = params["norm_mu"]   # (C_in,)
     sd = params["norm_sd"]   # (C_in,)
     x_norm = ((X_block.astype(np.float32) - mu[None, :]) / sd[None, :]).T  # (C_in, T)
 
-    logits1 = _forward_stage(x_norm, params, "stage1", STAGE1_DILATIONS)   # (5, T)
+    logits1 = _forward_stage(x_norm, params, "stage1", STAGE1_DILATIONS)   # (5 or 6, T)
     probs_had = _softmax3(logits1[:3])                                     # (3, T)
     prob_chg = _sigmoid(logits1[3:4])                                      # (1, T)
     prob_de = _sigmoid(logits1[4:5])                                       # (1, T)
-    stage2_in = np.concatenate([probs_had, prob_chg, prob_de], axis=0).astype(np.float32)
-    logits2 = _forward_stage(stage2_in, params, "stage2", STAGE2_DILATIONS)  # (5, T)
+    if logits1.shape[0] >= 6:
+        off1 = np.tanh(logits1[5:6])                                       # (1, T)
+        stage2_in = np.concatenate([probs_had, prob_chg, prob_de, off1], axis=0).astype(np.float32)
+    else:
+        stage2_in = np.concatenate([probs_had, prob_chg, prob_de], axis=0).astype(np.float32)
+    logits2 = _forward_stage(stage2_in, params, "stage2", STAGE2_DILATIONS)
     return logits1.T, logits2.T
 
 
-def predict_game_numpy(X, blocks, params):
+def predict_game_numpy(X, blocks, params, max_offset=15.0):
     """Predict logits across all graded blocks of a game.
     Returns dict with:
       - s_team_raw: (N,) float32 = logit_H - logit_A
       - s_dead_raw: (N,) float32 = logit_D - logaddexp(logit_H, logit_A)
       - p_change:   (N,) float32 = sigmoid(logit_change)
       - p_dead_edge:(N,) float32 = sigmoid(logit_dead_edge)
+      - delta_t:    (N,) float32 = tanh(raw_offset) * max_offset (if 6-head model, else zeros)
     """
     n = len(X)
     s_team_raw = np.zeros(n, dtype=np.float32)
     s_dead_raw = np.zeros(n, dtype=np.float32)
     p_change = np.zeros(n, dtype=np.float32)
     p_dead_edge = np.zeros(n, dtype=np.float32)
+    delta_t = np.zeros(n, dtype=np.float32)
 
     for _, lo, hi in blocks:
         _, l2 = forward_block_numpy(X[lo:hi + 1], params)
@@ -471,12 +477,15 @@ def predict_game_numpy(X, blocks, params):
         s_dead_raw[lo:hi + 1] = ld - np.logaddexp(lh, la)
         p_change[lo:hi + 1] = _sigmoid(lchg)
         p_dead_edge[lo:hi + 1] = _sigmoid(lde)
+        if l2.shape[1] >= 6:
+            delta_t[lo:hi + 1] = np.tanh(l2[:, 5]) * float(max_offset)
 
     return {
         "s_team_raw": s_team_raw,
         "s_dead_raw": s_dead_raw,
         "p_change": p_change,
         "p_dead_edge": p_dead_edge,
+        "delta_t": delta_t,
     }
 
 
@@ -510,7 +519,13 @@ def emissions_from_weights(f, blocks, pitch, ball_evidence, weights):
             "s_dead_raw": 0.5 * (out["s_dead_raw"] + out_swap["s_dead_raw"]),
             "p_change": 0.5 * (out["p_change"] + out_swap["p_change"]),
             "p_dead_edge": 0.5 * (out["p_dead_edge"] + out_swap["p_dead_edge"]),
+            "delta_t": 0.5 * (out["delta_t"] + out_swap["delta_t"]),
         }
+    weights["_last_p_dead_edge"] = out["p_dead_edge"]
+    if int(params["stage2.out_proj.bias"].shape[0]) >= 6:
+        weights["_last_delta_t"] = out["delta_t"]
+    else:
+        weights.pop("_last_delta_t", None)
     s_team = (out["s_team_raw"] * float(weights.get("t_team", 1.0))).astype(np.float32)
     s_dead = (out["s_dead_raw"] * float(weights.get("t_dead", 1.0))).astype(np.float32)
     return s_team, s_dead, out["p_change"]
