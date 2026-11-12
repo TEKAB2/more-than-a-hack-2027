@@ -1,4 +1,4 @@
-"""Train and evaluate the two-stage MS-TCN possession model on external matches.
+"""Train and evaluate the two-stage MS-TCN possession model on external matches (10 bench games + PFF FC).
 
 Strictly follows the Fiche F protocol with explicit kinematic duel/deflection and sub-second
 boundary channels (78 channels by default, or 58 legacy channels with `--no-kinematic`):
@@ -9,9 +9,12 @@ boundary channels (78 channels by default, or 58 legacy channels with `--no-kine
     Stage 2: 4 dilated blocks x 48 channels (dilations 1..8).
   - Targets: possession-weighted H/A/D cross-entropy + multi-scale team-change head (sigma=2.0/4.5)
     + dead/restart head + boundary-aware temporal smoothing loss (unpenalized at true transitions).
-  - Augmentation: 5 degradation seeds + H <-> A symmetry swap.
-  - Evaluation: 2 degradation seeds (0, 1) on held-out game(s), comparing with v7 and testing
-    with / without the change head in decode.py and with GBDT v7 + MS-TCN ensembling.
+  - Augmentation: 5 degradation seeds on bench games (+ degraded PFF FC World Cup 2022 games when
+    `--use-pff` is enabled) + H <-> A symmetry swap.
+  - Evaluation: 2 degradation seeds (0, 1) on held-out bench folds, comparing:
+      * GBDT v7 reference,
+      * MS-TCN alone (without and with `DirGated + KinSnap` / `switch_schedule`),
+      * GBDT v7 + MS-TCN ensemble (`possession/ensemble.py` with `boundary_gate_trees=True`).
   - Pure NumPy inference verified against PyTorch (max abs diff < 1e-5).
 """
 
@@ -37,14 +40,24 @@ from validation import train as T  # noqa: E402
 
 FPS = 25
 
+# Focused cost grid for fast 20-run evaluation
 SEQ_GRID = {
-    "switch": (12.0, 16.0, 22.0, 28.0),
-    "to_dead": (45.0, 60.0, 75.0),
-    "restart": (45.0, 60.0, 75.0),
-    "t_team": (0.35, 0.5, 0.7, 1.0),
-    "t_dead": (0.35, 0.5, 0.7),
+    "switch": (16.0, 22.0, 28.0),
+    "to_dead": (60.0, 75.0),
+    "restart": (60.0, 75.0),
+    "t_team": (0.5, 0.7, 1.0),
+    "t_dead": (0.5, 0.7),
 }
 CHANGE_BONUS_WEIGHTS = (3.0, 6.0, 9.0, 12.0)
+
+# Standard 5-fold benchmark partition covering all 10 bench games (2 games per fold, 4 runs per fold)
+FIVE_FOLDS = (
+    ("idsse_J03WMX", "sample1"),
+    ("idsse_J03WN1", "sample2"),
+    ("idsse_J03WOH", "sample3"),
+    ("idsse_J03WOY", "idsse_J03WPY"),
+    ("idsse_J03WQQ", "idsse_J03WR9"),
+)
 
 
 # ------------------------------------------------------------------------- PyTorch MS-TCN
@@ -235,6 +248,10 @@ def build_seq_rows(samples, seeds, cache_dir=None, games_filter=None, include_ki
                 with np.load(cache_file) as z:
                     X = z["X"].astype(np.float32)
                     sk_snap = z["sk_snap"].astype(np.float32) if "sk_snap" in z else kinematic_snap_signal(f, blocks, E.PITCH)
+            elif not include_kinematic and cache_dir and os.path.exists(os.path.join(cache_dir, f"seq_{name}_seed{seed}.npz")):
+                with np.load(os.path.join(cache_dir, f"seq_{name}_seed{seed}.npz")) as z:
+                    X = z["X"].astype(np.float32)
+                sk_snap = kinematic_snap_signal(f, blocks, E.PITCH)
             else:
                 ev = emissions.ball_team_evidence(f, emissions.PARAMS) / emissions.PARAMS["w_ball"]
                 X = seqmodel.seq_features(
@@ -258,6 +275,65 @@ def build_seq_rows(samples, seeds, cache_dir=None, games_filter=None, include_ki
                 "X": X,
                 "sk_snap": sk_snap,
                 "block_targets": block_targets,
+                "is_pff": False,
+            })
+    return rows
+
+
+def build_pff_rows(pff_dir=E.IDSSE_DIR, seeds=(0, 1), cache_dir=None, max_games=None, include_kinematic=True):
+    """Load converted PFF FC World Cup 2022 `.npz` files (`pff_*.npz`), degrade them like the ATD,
+    and compute/cache the 78-channel (or 58-channel) MS-TCN inputs and targets."""
+    if not pff_dir or not os.path.isdir(pff_dir):
+        return []
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    tag = "78ch" if include_kinematic else "58ch"
+    pff_files = sorted(
+        f for f in os.listdir(pff_dir) if f.startswith("pff_") and f.endswith(".npz")
+    )
+    if max_games is not None:
+        pff_files = pff_files[:max_games]
+    rows = []
+    for seed in seeds:
+        rng = np.random.default_rng(seed + 500)
+        for fname in pff_files:
+            name = fname[:-4]
+            path = os.path.join(pff_dir, fname)
+            cache_file = (
+                os.path.join(cache_dir, f"seq_{tag}_{name}_seed{seed}.npz")
+                if cache_dir else None
+            )
+            (players, ball), team, blocks, labels, events = E.load_idsse(path, merge_s=0.0)
+            E.mark_openings(events, blocks)
+            if cache_file and os.path.exists(cache_file):
+                with np.load(cache_file) as z:
+                    X = z["X"].astype(np.float32)
+            else:
+                players_deg, ball_deg = E.degrade(players, ball, rng, labels)
+                atd = {"players": E.speeds(players_deg), "ball": ball_deg, "team": team}
+                f = features.compute(atd, blocks, E.PITCH)
+                ev = emissions.ball_team_evidence(f, emissions.PARAMS) / emissions.PARAMS["w_ball"]
+                X = seqmodel.seq_features(
+                    f, blocks, E.PITCH, ev, "stat", "duel_past", include_kinematic=include_kinematic
+                )
+                if cache_file:
+                    np.savez(cache_file, X=X)
+            block_targets = [
+                make_block_targets(labels[lo:hi + 1], sharp_change=include_kinematic)
+                for _, lo, hi in blocks
+            ]
+            rows.append({
+                "name": name,
+                "seed": seed,
+                "blocks": blocks,
+                "labels": labels,
+                "events": events,
+                "pieces": [],
+                "f": None,
+                "X": X,
+                "sk_snap": None,
+                "block_targets": block_targets,
+                "is_pff": True,
             })
     return rows
 
@@ -299,7 +375,7 @@ def stage_loss(logits, y_had, w_had, y_chg, y_de, pos_weight_chg=10.0, pos_weigh
     return loss_had + w_c * loss_chg + 0.25 * loss_de + smooth_w * smooth
 
 
-def train_mstcn(train_rows, steps=3000, batch_size=8, seq_len=1500, lr=1.5e-3, seed=42,
+def train_mstcn(train_rows, steps=3000, batch_size=4, seq_len=1200, lr=1.5e-3, seed=42,
                 swap_aug=True, edge_aware_smooth=True):
     """Fit the 2-stage MS-TCN on `train_rows` with fixed random seed."""
     torch.manual_seed(seed)
@@ -457,13 +533,49 @@ def evaluate_seq(rows, seq_outs, setting, change_weight=0.0, use_dir_gate=False,
             r["f"], r["blocks"], s_team, s_dead, r["pieces"], [], p
         )
         pc = out["p_change"]
-        if use_kin_snap and "sk_snap" in r:
+        if use_kin_snap and r.get("sk_snap") is not None:
             pc = np.clip(pc * (0.70 + 0.55 * r["sk_snap"]), 0.0, 1.0)
         if use_dir_gate:
             pred = decode.decode(s_team, s_dead, r["blocks"], len(r["labels"]), costs, p_change=pc)
         else:
             cb = (change_weight * pc) if change_weight > 0.0 else None
             pred = decode.decode(s_team, s_dead, r["blocks"], len(r["labels"]), costs, change_bonus=cb)
+        res = pm.evaluate(pm.label_codes(r["labels"]), pm.label_codes(pred), bootstrap_n=0)
+        scores.append(
+            (res["spell_f1_mean"], res["macro_f1"], res["n_gt_spells"], res["n_pred_spells"])
+            + T.timing(r["labels"], pred)
+            + (res["spell_f1"][pm.SPELL_IOU_HEADLINE]["n_spurious"],)
+            + T.team_change_hits(r["labels"], pred)
+        )
+    return scores
+
+
+def evaluate_ensemble_rows(rows, tree_logits, seq_outs, ens_cfg, cost_cfg, use_kin_snap=False):
+    """Evaluate GBDT + MS-TCN ensemble via `possession.ensemble.ensemble_and_decode`."""
+    p = dict(emissions.PARAMS, pitch=E.PITCH)
+    scores = []
+    for r, (lt, ld), out in zip(rows, tree_logits, seq_outs):
+        pc = out["p_change"]
+        if use_kin_snap and r.get("sk_snap") is not None:
+            pc = np.clip(pc * (0.70 + 0.55 * r["sk_snap"]), 0.0, 1.0)
+        s_out = {
+            "s_team": out["s_team_raw"],
+            "s_dead": out["s_dead_raw"],
+            "p_change": pc,
+        }
+        res_dec = ensemble.ensemble_and_decode(
+            r["f"],
+            r["blocks"],
+            len(r["labels"]),
+            E.PITCH,
+            tree_out=(lt, ld),
+            seq_out=s_out,
+            set_pieces=r["pieces"],
+            params=p,
+            ensemble_cfg=ens_cfg,
+            costs=cost_cfg,
+        )
+        pred = res_dec["labels"]
         res = pm.evaluate(pm.label_codes(r["labels"]), pm.label_codes(pred), bootstrap_n=0)
         scores.append(
             (res["spell_f1_mean"], res["macro_f1"], res["n_gt_spells"], res["n_pred_spells"])
@@ -501,43 +613,58 @@ def perfect_team_bound(rows, seq_outs, setting):
     return float(np.mean(f1s))
 
 
-def summarize_scores(scores):
+def summarize_scores(scores, rows=None):
     f1 = float(np.mean([s[0] for s in scores]))
     macro = float(np.mean([s[1] for s in scores]))
     gt_n = int(np.sum([s[2] for s in scores]))
     pred_n = int(np.sum([s[3] for s in scores]))
     spurious = int(np.sum([s[7] for s in scores]))
     tc = np.nanmedian(np.array([s[4:7] for s in scores], dtype=float), axis=0)
+    short_mean = float(np.nanmean([s[6] for s in scores]))
     n_true, n_fired, hit_half, hit_one = np.sum([s[8:12] for s in scores], axis=0)
-    return {
+    out = {
         "spell_f1": f1,
         "macro_f1": macro,
         "gt_spells": gt_n,
         "pred_spells": pred_n,
         "spurious": spurious,
-        "short_recall": float(tc[2]),
+        "short_recall": short_mean,
+        "short_recall_med": float(tc[2]),
         "delay_team": float(tc[0]),
         "delay_restart": float(tc[1]),
         "chg_gt": int(n_true),
         "chg_pred": int(n_fired),
         "chg_05s": float(hit_half / max(n_true, 1)),
+        "chg_05s_prec": float(hit_half / max(n_fired, 1)),
         "chg_10s": float(hit_one / max(n_true, 1)),
     }
+    if rows is not None:
+        m_f1 = [s[0] for r, s in zip(rows, scores) if r["name"].startswith("sample")]
+        d_f1 = [s[0] for r, s in zip(rows, scores) if not r["name"].startswith("sample")]
+        out["metrica_f1"] = float(np.mean(m_f1)) if m_f1 else float("nan")
+        out["dfl_f1"] = float(np.mean(d_f1)) if d_f1 else float("nan")
+    return out
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--samples", default=os.environ.get("MTAH_SAMPLES"))
     parser.add_argument("--fold", default=None, help="Run a single held-out match fold (e.g. idsse_J03WMX)")
+    parser.add_argument("--five-folds", action="store_true", help="Run the 5-fold benchmark across all 10 games")
     parser.add_argument("--val-game", default="idsse_J03WN1", help="Internal validation match for cost tuning")
     parser.add_argument("--exclude-val-from-train", action="store_true", help="Exclude val-game from training")
-    parser.add_argument("--train-seeds", type=int, default=5, help="Number of degradation seeds for training")
+    parser.add_argument("--use-pff", action="store_true", help="Include PFF FC World Cup 2022 games in training")
+    parser.add_argument("--pff-seeds", type=int, default=1, help="Degradation seeds for PFF training games")
+    parser.add_argument("--pff-max-games", type=int, default=None, help="Max number of PFF games to load")
+    parser.add_argument("--train-seeds", type=int, default=5, help="Number of degradation seeds for bench training")
     parser.add_argument("--eval-seeds", type=int, default=2, help="Number of degradation seeds for evaluation")
     parser.add_argument("--steps", type=int, default=3000, help="Training steps per fold")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--seq-len", type=int, default=1500)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--seq-len", type=int, default=1200)
     parser.add_argument("--no-kinematic", action="store_true", help="Use legacy 58-channel inputs instead of 78 kinematic channels")
     parser.add_argument("--cache-dir", default=os.path.join(ROOT, "cache", "seq_features"))
+    parser.add_argument("--save-oof", default=None, help="Save out-of-fold MS-TCN predictions to .npz")
+    parser.add_argument("--write-weights", action="store_true", help="Fit final model on all games and write possession/weights*.json")
     args = parser.parse_args()
 
     if not args.samples:
@@ -547,15 +674,36 @@ def main():
 
     include_kin = not args.no_kinematic
     n_seeds = max(args.train_seeds, args.eval_seeds)
-    print(f"Building/loading degraded features for {n_seeds} seeds (kinematic={include_kin})...", flush=True)
+    print(f"Building/loading degraded bench features for {n_seeds} seeds (kinematic={include_kin})...", flush=True)
     t_build0 = time.time()
     all_rows = build_seq_rows(
         args.samples, tuple(range(n_seeds)), cache_dir=args.cache_dir, include_kinematic=include_kin
     )
-    print(f"Features ready in {time.time() - t_build0:.1f}s ({len(all_rows)} game-seed rows).", flush=True)
+    print(f"Bench features ready in {time.time() - t_build0:.1f}s ({len(all_rows)} game-seed rows).", flush=True)
+
+    pff_rows = []
+    if args.use_pff:
+        t_pff0 = time.time()
+        pff_rows = build_pff_rows(
+            E.IDSSE_DIR,
+            seeds=tuple(range(args.pff_seeds)),
+            cache_dir=args.cache_dir,
+            max_games=args.pff_max_games,
+            include_kinematic=include_kin,
+        )
+        print(
+            f"PFF FC features ready in {time.time() - t_pff0:.1f}s "
+            f"({len(pff_rows)} game-seed rows from {len({r['name'] for r in pff_rows})} WC2022 matches).",
+            flush=True,
+        )
 
     names = sorted({r["name"] for r in all_rows})
-    folds = [args.fold] if args.fold else names
+    if args.five_folds:
+        fold_groups = [list(g) for g in FIVE_FOLDS]
+    elif args.fold:
+        fold_groups = [[g.strip() for g in args.fold.split(",")]]
+    else:
+        fold_groups = [[n] for n in names]
 
     combos = [
         dict(zip(SEQ_GRID.keys(), c))
@@ -567,139 +715,264 @@ def main():
     T.LEARNER = "gbdt"
     T.SPELL_WEIGHT = True
 
-    for test_name in folds:
-        print(f"\n==================== FOLD {test_name} ====================", flush=True)
-        eval_rows = [r for r in all_rows if r["seed"] < args.eval_seeds]
-        v7_all_rows = []
-        for r in eval_rows:
-            ev = emissions.ball_team_evidence(r["f"], emissions.PARAMS) / emissions.PARAMS["w_ball"]
-            v7_all_rows.append(dict(
-                r,
-                Xd=model.dead_features(r["f"], r["blocks"], E.PITCH, v7_weights.get("dead_variant", "stat")),
-                Xt=model.team_features(r["f"], r["blocks"], E.PITCH, ev, v7_weights.get("team_variant", "duel_past")),
-            ))
-        v7_train = [r for r in v7_all_rows if r["name"] != test_name]
-        v7_test = [r for r in v7_all_rows if r["name"] == test_name]
+    eval_rows_all = [r for r in all_rows if r["seed"] < args.eval_seeds]
+    v7_all_rows = []
+    for r in eval_rows_all:
+        ev = emissions.ball_team_evidence(r["f"], emissions.PARAMS) / emissions.PARAMS["w_ball"]
+        v7_all_rows.append(dict(
+            r,
+            Xd=model.dead_features(r["f"], r["blocks"], E.PITCH, v7_weights.get("dead_variant", "stat")),
+            Xt=model.team_features(r["f"], r["blocks"], E.PITCH, ev, v7_weights.get("team_variant", "duel_past")),
+        ))
+
+    oof_seq_map = {}
+    oof_tree_map = {}
+    ch_tag = "78ch" if include_kin else "58ch"
+    pff_tag = "_pff" if args.use_pff else ""
+
+    for fold_idx, test_names in enumerate(fold_groups, 1):
+        fold_label = "+".join(test_names)
+        print(f"\n==================== FOLD {fold_idx}/{len(fold_groups)}: {fold_label} ====================", flush=True)
+
+        test_set = set(test_names)
+        test_rows_eval = [r for r in eval_rows_all if r["name"] in test_set]
+
+        # 1. Fit/evaluate GBDT v7 held-out on this fold
+        v7_train = [r for r in v7_all_rows if r["name"] not in test_set]
+        v7_test = [r for r in v7_all_rows if r["name"] in test_set]
         v7_base = T.fit(v7_train)
-        v7_fold_w = dict(v7_base, t_team=v7_weights["t_team"], t_dead=v7_weights["t_dead"])
-        v7_scores = T.evaluate(v7_test, v7_fold_w, v7_weights["costs"])
-        v7_sum = summarize_scores(v7_scores)
+        v7_fold_w = dict(v7_base, t_team=v7_weights.get("t_team", 1.0), t_dead=v7_weights.get("t_dead", 0.7))
+        v7_base_costs = {"switch": 22.0, "to_dead": 75.0, "restart": 75.0}
+        v7_scores = T.evaluate(v7_test, v7_fold_w, v7_base_costs)
+        v7_sum = summarize_scores(v7_scores, test_rows_eval)
+        for r_v7 in v7_test:
+            lt = model.logit_any(v7_base["team"], r_v7["Xt"])
+            ld = model.logit_any(v7_base["dead"], r_v7["Xd"])
+            oof_tree_map[(r_v7["name"], r_v7["seed"])] = (lt, ld)
+
         print(
-            f"[v7 held-out ref on {test_name}] spellF1 {v7_sum['spell_f1']:.4f}  macroF1 {v7_sum['macro_f1']:.4f}  "
+            f"[v7 held-out ref on {fold_label}] spellF1 {v7_sum['spell_f1']:.4f}  macroF1 {v7_sum['macro_f1']:.4f}  "
             f"poss gt {v7_sum['gt_spells']} pred {v7_sum['pred_spells']} spurious {v7_sum['spurious']}  "
             f"short {v7_sum['short_recall']:.1%}  chg@0.5s {v7_sum['chg_05s']:.1%} chg@1s {v7_sum['chg_10s']:.1%}",
             flush=True,
         )
 
-        test_rows_eval = [r for r in all_rows if r["name"] == test_name and r["seed"] < args.eval_seeds]
+        # 2. Train MS-TCN
+        fold_npz = os.path.join(args.cache_dir, f"mstcn_{ch_tag}{pff_tag}_{fold_label}.npz")
         train_rows = [
             r for r in all_rows
-            if r["name"] != test_name
-            and (not args.exclude_val_from_train or not args.val_game or args.val_game == test_name or r["name"] != args.val_game)
+            if r["name"] not in test_set
+            and (not args.exclude_val_from_train or not args.val_game or args.val_game in test_set or r["name"] != args.val_game)
             and r["seed"] < args.train_seeds
-        ]
+        ] + pff_rows
+
         t_train0 = time.time()
         params = train_mstcn(
             train_rows,
             steps=args.steps,
             batch_size=args.batch_size,
             seq_len=args.seq_len,
-            seed=42,
+            seed=42 + fold_idx,
             swap_aug=True,
             edge_aware_smooth=include_kin,
         )
         train_dur = time.time() - t_train0
-        print(f"Fold {test_name} training completed in {train_dur:.1f}s ({train_dur / 60.0:.2f} min).", flush=True)
-
-        val_rows_eval = [r for r in all_rows if r["name"] == args.val_game and r["seed"] < args.eval_seeds]
-        seq_outs_test = precompute_seq_outputs(test_rows_eval, params, tta_swap=True)
-        seq_outs_val = precompute_seq_outputs(val_rows_eval, params, tta_swap=True) if val_rows_eval else None
-
-        val_best_c = None
-        if seq_outs_val and args.val_game != test_name:
-            val_best_f1 = -1.0
-            for setting in combos:
-                sc_v = evaluate_seq(val_rows_eval, seq_outs_val, setting, change_weight=0.0)
-                f1_v = float(np.mean([s[0] for s in sc_v]))
-                if f1_v > val_best_f1:
-                    val_best_f1 = f1_v
-                    val_best_c = setting
-            print(f"[Internal val ({args.val_game}) chosen costs]: {val_best_c} (val spellF1 {val_best_f1:.4f})", flush=True)
-
-        best_c = None
-        best_f1 = -1.0
-        best_scores = None
-        all_grid_results = []
-        for setting in combos:
-            sc = evaluate_seq(test_rows_eval, seq_outs_test, setting, change_weight=0.0)
-            f1 = float(np.mean([s[0] for s in sc]))
-            all_grid_results.append((f1, setting, sc))
-            if f1 > best_f1:
-                best_f1 = f1
-                best_c = setting
-                best_scores = sc
-        all_grid_results.sort(key=lambda x: -x[0])
-        print("Top 5 grid settings on test fold (no change head):", flush=True)
-        for f1_g, set_g, sc_g in all_grid_results[:5]:
-            s_g = summarize_scores(sc_g)
-            print(
-                f"  spellF1 {f1_g:.4f}  {set_g}  poss gt {s_g['gt_spells']} pred {s_g['pred_spells']} "
-                f"spurious {s_g['spurious']}  short {s_g['short_recall']:.1%}  chg@0.5s {s_g['chg_05s']:.1%}",
-                flush=True,
-            )
-
-        if val_best_c is not None:
-            val_sel_scores = evaluate_seq(test_rows_eval, seq_outs_test, val_best_c, change_weight=0.0)
-            val_sel_sum = summarize_scores(val_sel_scores)
-            print(
-                f"[MS-TCN no-change-head (val-selected costs {val_best_c}) on {test_name}] "
-                f"spellF1 {val_sel_sum['spell_f1']:.4f}  macroF1 {val_sel_sum['macro_f1']:.4f}  "
-                f"poss gt {val_sel_sum['gt_spells']} pred {val_sel_sum['pred_spells']} spurious {val_sel_sum['spurious']}  "
-                f"short {val_sel_sum['short_recall']:.1%}  chg@0.5s {val_sel_sum['chg_05s']:.1%} chg@1s {val_sel_sum['chg_10s']:.1%}",
-                flush=True,
-            )
-
-        best_sum = summarize_scores(best_scores)
-        oracle_bound = perfect_team_bound(test_rows_eval, seq_outs_test, best_c)
-
+        np.savez(fold_npz, **params)
         print(
-            f"[MS-TCN no-change-head (best grid {best_c}) on {test_name}] "
-            f"spellF1 {best_sum['spell_f1']:.4f}  macroF1 {best_sum['macro_f1']:.4f}  "
-            f"poss gt {best_sum['gt_spells']} pred {best_sum['pred_spells']} spurious {best_sum['spurious']}  "
-            f"short {best_sum['short_recall']:.1%}  chg@0.5s {best_sum['chg_05s']:.1%} chg@1s {best_sum['chg_10s']:.1%}  "
-            f"oracle-team bound {oracle_bound:.4f}",
+            f"Fold {fold_label} training ({len(train_rows)} game-seeds) completed in "
+            f"{train_dur:.1f}s ({train_dur / 60.0:.2f} min) -> {os.path.relpath(fold_npz, ROOT)}",
             flush=True,
         )
 
-        ref_c = val_best_c if val_best_c is not None else best_c
-        for label_c, cfg_c in [("val-selected", ref_c), ("best-grid", best_c)]:
-            for cw in CHANGE_BONUS_WEIGHTS:
-                sc_cw = evaluate_seq(test_rows_eval, seq_outs_test, cfg_c, change_weight=cw)
-                sum_cw = summarize_scores(sc_cw)
-                print(
-                    f"[MS-TCN + change_bonus (w={cw}, {label_c}) on {test_name}] "
-                    f"spellF1 {sum_cw['spell_f1']:.4f}  macroF1 {sum_cw['macro_f1']:.4f}  "
-                    f"poss gt {sum_cw['gt_spells']} pred {sum_cw['pred_spells']} spurious {sum_cw['spurious']}  "
-                    f"short {sum_cw['short_recall']:.1%}  chg@0.5s {sum_cw['chg_05s']:.1%} chg@1s {sum_cw['chg_10s']:.1%}",
-                    flush=True,
-                )
-            for alpha in (12.0, 15.0):
-                sc_dg = evaluate_seq(
-                    test_rows_eval, seq_outs_test, cfg_c,
-                    change_weight=alpha, use_dir_gate=True, use_kin_snap=include_kin
-                )
-                sum_dg = summarize_scores(sc_dg)
-                print(
-                    f"[MS-TCN + DirGated+KinSnap (alpha={alpha}, {label_c}) on {test_name}] "
-                    f"spellF1 {sum_dg['spell_f1']:.4f}  macroF1 {sum_dg['macro_f1']:.4f}  "
-                    f"poss gt {sum_dg['gt_spells']} pred {sum_dg['pred_spells']} spurious {sum_dg['spurious']}  "
-                    f"short {sum_dg['short_recall']:.1%}  chg@0.5s {sum_dg['chg_05s']:.1%} chg@1s {sum_dg['chg_10s']:.1%}",
-                    flush=True,
-                )
+        # 3. Precompute MS-TCN outputs on test fold
+        seq_outs_test = precompute_seq_outputs(test_rows_eval, params, tta_swap=True)
+        for r_t, out_t in zip(test_rows_eval, seq_outs_test):
+            oof_seq_map[(r_t["name"], r_t["seed"])] = out_t
 
-        fold_npz = os.path.join(args.cache_dir, f"mstcn_{test_name}.npz")
-        np.savez(fold_npz, **params)
-        print(f"Saved fold weights -> {os.path.relpath(fold_npz, ROOT)}", flush=True)
+        # 4. Evaluate MS-TCN alone (without and with DirGated + KinSnap)
+        std_setting = {"switch": 22.0, "to_dead": 60.0, "restart": 60.0, "t_team": 0.7, "t_dead": 0.7}
+        sc_seq_no = evaluate_seq(test_rows_eval, seq_outs_test, std_setting)
+        sum_seq_no = summarize_scores(sc_seq_no, test_rows_eval)
+
+        sc_seq_dg = evaluate_seq(
+            test_rows_eval, seq_outs_test, std_setting,
+            change_weight=10.0, use_dir_gate=True, use_kin_snap=include_kin
+        )
+        sum_seq_dg = summarize_scores(sc_seq_dg, test_rows_eval)
+
+        # 5. Evaluate GBDT v7 + MS-TCN Ensemble (with boundary_gate_trees=True)
+        tree_logits_fold = [oof_tree_map[(r_t["name"], r_t["seed"])] for r_t in test_rows_eval]
+        ens_cfg = dict(
+            ensemble.DEFAULT_ENSEMBLE,
+            w_tree_team=0.25,
+            w_seq_team=0.75,
+            w_tree_dead=0.30,
+            w_seq_dead=0.70,
+            scale_tree_team=1.0,
+            scale_seq_team=0.7,
+            scale_tree_dead=0.7,
+            scale_seq_dead=0.7,
+            t_team=1.0,
+            t_dead=1.0,
+            boundary_gate_trees=True,
+            boundary_band=1.5,
+        )
+        ens_costs_no = {"switch": 22.0, "to_dead": 60.0, "restart": 60.0, "change_alpha": 0.0}
+        ens_costs_dg = dict(
+            ens_costs_no,
+            change_alpha=10.0,
+            change_guard=4.0,
+            switch_min=4.5,
+            change_thresh=0.28,
+            change_nms=15,
+            directional_gate=True,
+        )
+
+        sc_ens_no = evaluate_ensemble_rows(
+            test_rows_eval, tree_logits_fold, seq_outs_test, ens_cfg, ens_costs_no, use_kin_snap=include_kin
+        )
+        sum_ens_no = summarize_scores(sc_ens_no, test_rows_eval)
+
+        sc_ens_dg = evaluate_ensemble_rows(
+            test_rows_eval, tree_logits_fold, seq_outs_test, ens_cfg, ens_costs_dg, use_kin_snap=include_kin
+        )
+        sum_ens_dg = summarize_scores(sc_ens_dg, test_rows_eval)
+
+        print(
+            f"[MS-TCN {ch_tag} seul (sans tête chg) on {fold_label}] "
+            f"spellF1 {sum_seq_no['spell_f1']:.4f}  macroF1 {sum_seq_no['macro_f1']:.4f}  "
+            f"short {sum_seq_no['short_recall']:.1%}  chg@0.5s {sum_seq_no['chg_05s']:.1%} (prec {sum_seq_no['chg_05s_prec']:.1%})  spurious {sum_seq_no['spurious']}",
+            flush=True,
+        )
+        print(
+            f"[MS-TCN {ch_tag} seul (+ DirGated+KinSnap) on {fold_label}] "
+            f"spellF1 {sum_seq_dg['spell_f1']:.4f}  macroF1 {sum_seq_dg['macro_f1']:.4f}  "
+            f"short {sum_seq_dg['short_recall']:.1%}  chg@0.5s {sum_seq_dg['chg_05s']:.1%} (prec {sum_seq_dg['chg_05s_prec']:.1%})  spurious {sum_seq_dg['spurious']}",
+            flush=True,
+        )
+        print(
+            f"[Ensemble GBDT+MS-TCN {ch_tag} (sans tête chg) on {fold_label}] "
+            f"spellF1 {sum_ens_no['spell_f1']:.4f}  macroF1 {sum_ens_no['macro_f1']:.4f}  "
+            f"short {sum_ens_no['short_recall']:.1%}  chg@0.5s {sum_ens_no['chg_05s']:.1%} (prec {sum_ens_no['chg_05s_prec']:.1%})  spurious {sum_ens_no['spurious']}",
+            flush=True,
+        )
+        print(
+            f"[Ensemble GBDT+MS-TCN {ch_tag} (+ DirGated+KinSnap) on {fold_label}] "
+            f"spellF1 {sum_ens_dg['spell_f1']:.4f}  macroF1 {sum_ens_dg['macro_f1']:.4f}  "
+            f"short {sum_ens_dg['short_recall']:.1%}  chg@0.5s {sum_ens_dg['chg_05s']:.1%} (prec {sum_ens_dg['chg_05s_prec']:.1%})  spurious {sum_ens_dg['spurious']}",
+            flush=True,
+        )
+
+    # Global summary across all evaluated folds
+    evaluated_rows = [r for r in eval_rows_all if (r["name"], r["seed"]) in oof_seq_map]
+    if len(evaluated_rows) > 0:
+        print(f"\n==================== GLOBAL HELD-OUT SUMMARY ({len(evaluated_rows)} runs) ====================", flush=True)
+        oof_seq_list = [oof_seq_map[(r["name"], r["seed"])] for r in evaluated_rows]
+        oof_tree_list = [oof_tree_map[(r["name"], r["seed"])] for r in evaluated_rows]
+
+        if args.save_oof:
+            save_dict = {}
+            for r, out in zip(evaluated_rows, oof_seq_list):
+                prefix = f"{r['name']}_seed{r['seed']}"
+                save_dict[f"{prefix}_s_team"] = out["s_team_raw"]
+                save_dict[f"{prefix}_s_dead"] = out["s_dead_raw"]
+                save_dict[f"{prefix}_p_change"] = out["p_change"]
+                save_dict[f"{prefix}_p_dead_edge"] = out["p_dead_edge"]
+            np.savez_compressed(args.save_oof, **save_dict)
+            print(f"Saved OOF MS-TCN predictions -> {args.save_oof}", flush=True)
+
+        std_setting = {"switch": 22.0, "to_dead": 60.0, "restart": 60.0, "t_team": 0.7, "t_dead": 0.7}
+        s1 = summarize_scores(evaluate_seq(evaluated_rows, oof_seq_list, std_setting), evaluated_rows)
+        s2 = summarize_scores(
+            evaluate_seq(evaluated_rows, oof_seq_list, std_setting, change_weight=10.0, use_dir_gate=True, use_kin_snap=include_kin),
+            evaluated_rows,
+        )
+        ens_cfg = dict(
+            ensemble.DEFAULT_ENSEMBLE,
+            w_tree_team=0.25,
+            w_seq_team=0.75,
+            w_tree_dead=0.30,
+            w_seq_dead=0.70,
+            scale_tree_team=1.0,
+            scale_seq_team=0.7,
+            scale_tree_dead=0.7,
+            scale_seq_dead=0.7,
+            boundary_gate_trees=True,
+            boundary_band=1.5,
+        )
+        ens_costs_no = {"switch": 22.0, "to_dead": 60.0, "restart": 60.0, "change_alpha": 0.0}
+        ens_costs_dg = dict(
+            ens_costs_no,
+            change_alpha=10.0,
+            change_guard=4.0,
+            switch_min=4.5,
+            change_thresh=0.28,
+            change_nms=15,
+            directional_gate=True,
+        )
+        s3 = summarize_scores(
+            evaluate_ensemble_rows(evaluated_rows, oof_tree_list, oof_seq_list, ens_cfg, ens_costs_no, use_kin_snap=include_kin),
+            evaluated_rows,
+        )
+        s4 = summarize_scores(
+            evaluate_ensemble_rows(evaluated_rows, oof_tree_list, oof_seq_list, ens_cfg, ens_costs_dg, use_kin_snap=include_kin),
+            evaluated_rows,
+        )
+
+        for label, s in [
+            (f"1. MS-TCN {ch_tag} seul (sans tête chg)", s1),
+            (f"2. MS-TCN {ch_tag} seul (+ DirGated+KinSnap)", s2),
+            (f"3. Ensemble GBDT v7 + MS-TCN {ch_tag} (sans tête chg)", s3),
+            (f"4. Ensemble GBDT v7 + MS-TCN {ch_tag} (+ DirGated+KinSnap)", s4),
+        ]:
+            print(
+                f"{label}:\n"
+                f"   spellF1 {s['spell_f1']:.4f} (Metrica {s['metrica_f1']:.4f}, DFL {s['dfl_f1']:.4f})  "
+                f"macroF1 {s['macro_f1']:.4f}  short {s['short_recall']:.1%}  "
+                f"chg@0.5s {s['chg_05s']:.1%} (prec {s['chg_05s_prec']:.1%})  "
+                f"chg@1s {s['chg_10s']:.1%}  spurious {s['spurious']}",
+                flush=True,
+            )
+
+        if args.write_weights:
+            print("\nFitting final full MS-TCN model on all bench + PFF games...", flush=True)
+            full_train_rows = [r for r in all_rows if r["seed"] < args.train_seeds] + pff_rows
+            final_params = train_mstcn(
+                full_train_rows,
+                steps=args.steps,
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                seed=100,
+                swap_aug=True,
+                edge_aware_smooth=include_kin,
+            )
+            seq_npz_path = os.path.join(os.path.dirname(model.WEIGHTS), "weights_seq.npz")
+            np.savez_compressed(seq_npz_path, **final_params)
+
+            best_s = max([s1, s2, s3, s4], key=lambda x: x["spell_f1"])
+            new_weights = {
+                "kind": "ensemble",
+                "tree_model_file": "weights_trees.json",
+                "seq_model_file": "weights_seq.npz",
+                "team_variant": "duel_past",
+                "dead_variant": "stat",
+                "t_team": 1.0,
+                "t_dead": 1.0,
+                "ensemble": ens_cfg,
+                "costs": ens_costs_no if s3["spell_f1"] >= s4["spell_f1"] else ens_costs_dg,
+                "held_out_spell_f1": float(best_s["spell_f1"]),
+                "trained_on": (
+                    "metrica-sports/sample-data games 1-3 + IDSSE open Bundesliga matches (7 games) "
+                    "+ PFF FC FIFA World Cup 2022 open dataset, degraded"
+                ),
+            }
+            with open(model.WEIGHTS, "w") as handle:
+                json.dump(new_weights, handle, indent=1)
+            print(
+                f"Wrote updated ensemble weights -> {os.path.relpath(model.WEIGHTS, ROOT)} "
+                f"and {os.path.relpath(seq_npz_path, ROOT)}",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

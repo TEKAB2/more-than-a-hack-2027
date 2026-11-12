@@ -305,6 +305,24 @@ def load_weights(path=WEIGHTS):
         from possession import seqmodel
         npz_path = os.path.join(os.path.dirname(path), w["model_file"])
         w["seq_params"] = seqmodel.load_seq_params(npz_path)
+    elif w.get("kind") == "ensemble":
+        from possession import seqmodel
+        base_dir = os.path.dirname(path)
+        with open(os.path.join(base_dir, w["tree_model_file"])) as handle:
+            models = json.load(handle)
+        w["tree_weights"] = {
+            "dead": models["dead"],
+            "team": models["team"],
+            "dead_variant": w.get("dead_variant", "stat"),
+            "team_variant": w.get("team_variant", "duel_past"),
+            "t_team": 1.0,
+            "t_dead": 1.0,
+        }
+        seq_files = w.get("seq_model_files") or [w["seq_model_file"]]
+        w["seq_params_list"] = [
+            seqmodel.load_seq_params(os.path.join(base_dir, sf)) for sf in seq_files
+        ]
+        w["seq_params"] = w["seq_params_list"][0]
     return w
 
 
