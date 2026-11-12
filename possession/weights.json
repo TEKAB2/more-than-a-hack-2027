@@ -1,16 +1,15 @@
 {
- "t_team": 1.4,
+ "t_team": 1.0,
  "t_dead": 0.7,
- "team_variant": "touch",
+ "team_variant": "duel_past",
  "dead_variant": "stat",
  "costs": {
-  "switch": 15.0,
-  "to_dead": 55.0,
-  "restart": 55.0
+  "switch": 22.0,
+  "to_dead": 75.0,
+  "restart": 75.0
  },
- "held_out_spell_f1": 0.6136138497857863,
+ "held_out_spell_f1": 0.6833380658991642,
  "trained_on": "metrica-sports/sample-data games 1-3 + IDSSE open Bundesliga matches (validation/external_data), degraded",
  "kind": "gbdt",
- "model_file": "weights_trees.json",
- "fitted_with": "scikit-learn 1.9.1 HistGradientBoostingClassifier, exported to JSON (possession/model.py: export_trees)"
+ "model_file": "weights_trees.json"
 }

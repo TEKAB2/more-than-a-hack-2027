@@ -145,3 +145,38 @@ entre joueurs après alignement).
 
 **Critère de réussite** : le « ballon vu » des images en jeu passe de ~87 % à plus de 93 %, puis
 le score monte au banc une fois le simulateur ajusté.
+
+---
+
+## F. Modèle temporel profond (gain attendu : élevé ; GPU RTX 4070)
+
+**Constat** : aujourd'hui, le modèle d'émission juge chaque image avec des fenêtres fixes (0,2 à
+8 s), puis le Viterbi assemble les images avec trois coûts constants. Il ne voit donc jamais le
+déroulé complet d'une action : passe, duel, récupération, 2e touche. Résultat : seulement ~44 %
+des changements d'équipe tombent à ±0,5 s, et beaucoup de possessions courtes sont manquées.
+
+**Idée** : un réseau temporel qui lit la séquence d'indices déjà calculés (`features.compute`
++ `model.team_features` + `model.dead_features`) sur ±10 s, et qui sort, pour chaque image,
+P(H), P(A), P(D) ainsi que P(changement de possession ici). Ces sorties remplacent les
+émissions actuelles, et le Viterbi est gardé pour la cohérence globale.
+Architecture conseillée : réseau convolutif temporel dilaté (TCN) bidirectionnel, ou BiGRU,
+petit (< 1 M de paramètres) : l'entraînement doit tenir en moins de 1 h sur la 4070.
+
+**Fichiers autorisés** : `possession/seqmodel.py` (nouveau), `validation/train_seq.py`
+(nouveau), `possession/emissions.py` (branchement derrière une option `kind: "seq"` dans
+`weights.json`).
+
+**Contraintes non négociables** :
+* L'**inférence en numpy pur**, sans torch : les poids sont exportés en `.npz` ou `.json`, et
+  conv1d, GRU et softmax sont réécrits en numpy, avec un test d'égalité numérique contre torch
+  (écart maximal < 1e-5) puis un hash identique sur deux exécutions.
+* Données d'entraînement : les mêmes 10 matchs du banc, dégradés (`validation/external.py`), avec
+  plusieurs graines de dégradation. **Jamais le match fourni.**
+* Évaluation identique au banc : un match exclu à la fois, 2 graines ; rapporter spellF1 (10
+  matchs, Metrica seul, DFL seul), possessions courtes retrouvées, fausses possessions,
+  changements à ±0,5 s et à ±1 s.
+* Graines fixées partout. L'agent ne lit jamais les données du match.
+
+**Critère de réussite** : spellF1 du banc ≥ 0,72 (référence v7 : 0,683) et changements
+retrouvés à ±0,5 s ≥ 55 % (référence : 44 %). Échéance : vendredi midi, sinon on soumet la
+meilleure version déjà validée.
