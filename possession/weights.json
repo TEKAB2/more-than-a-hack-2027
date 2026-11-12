@@ -1,23 +1,30 @@
 {
  "kind": "ensemble",
  "tree_model_file": "weights_trees.json",
- "seq_model_file": "weights_seq.npz",
+ "seq_model_file": "weights_seq_102ch.npz",
  "seq_model_files": [
+  "weights_seq_102ch.npz",
+  "weights_seq_iou.npz",
   "weights_seq.npz",
-  "weights_seq_bench.npz",
-  "weights_seq_iou.npz"
+  "weights_seq_bench.npz"
  ],
  "team_variant": "duel_past",
  "dead_variant": "stat",
  "t_team": 1.0,
  "t_dead": 1.0,
  "ensemble": {
-  "w_tree_team": 0.12,
-  "w_seq_team": 0.88,
-  "w_tree_dead": 0.25,
-  "w_seq_dead": 0.75,
+  "w_tree_team": 0.1,
+  "w_seq_team": 0.9,
+  "w_tree_dead": 0.2,
+  "w_seq_dead": 0.8,
+  "seq_model_weights": [
+   0.5,
+   0.2,
+   0.15,
+   0.15
+  ],
   "scale_tree_team": 1.0,
-  "scale_seq_team": 0.78,
+  "scale_seq_team": 0.75,
   "scale_tree_dead": 0.7,
   "scale_seq_dead": 0.7,
   "t_team": 1.0,
@@ -33,7 +40,7 @@
  },
  "costs": {
   "decoder": "semi_markov",
-  "switch": 19.5,
+  "switch": 21.0,
   "to_dead": 60.0,
   "restart": 60.0,
   "duel_len": 38,
@@ -48,6 +55,6 @@
   "duel_damp": 0.25,
   "max_lookback": 50
  },
- "held_out_spell_f1": 0.767012,
- "trained_on": "metrica-sports/sample-data games 1-3 + IDSSE open Bundesliga matches (7 games) + PFF FC FIFA World Cup 2022 open dataset (20 games), degraded"
+ "held_out_spell_f1": 0.7751,
+ "trained_on": "metrica-sports/sample-data games 1-3 + IDSSE open Bundesliga matches (7 games) + PFF FC FIFA World Cup 2022 open dataset (20 games), degraded (102ch physics ball imputation + 22-player carrier/TTI + 78ch Soft-IoU/offset)"
 }

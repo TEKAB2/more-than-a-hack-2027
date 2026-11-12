@@ -95,7 +95,11 @@ BAR-ATH, the closest calibration so far):
 |---|---|
 | official baseline (±2 s window) | 0.257 |
 | model fitted on the v5 simulator (short in-play gaps) | 0.591 |
-| **v6: model fitted on the v6 simulator** | **0.614** (better on all 10 games) |
+| v6: GBDT fitted on the v6 simulator | 0.614 (better on all 10 games) |
+| v7: GBDT (`duel_past` + `stat`, 2 seeds) | 0.681 |
+| MS-TCN 58ch (2-stage dilated TCN) | 0.740 |
+| MS-TCN 78ch (kinematic deflection + boundary channels) | 0.764 |
+| **MS-TCN 102ch + GBDT ensemble (physics ball imputation + 22-player carrier & TTI)** | **0.775** (Metrica 0.805, DFL 0.763, macroF1 0.929, short <3s recall 61 %) |
 
  The baseline scores 0.283 on this bench against
 0.2433 on BAR-ATH, so this bench is somewhat easier than the real task; it ranks versions, it does
