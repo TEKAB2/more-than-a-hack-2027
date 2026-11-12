@@ -20,7 +20,6 @@ boundary channels (78 channels by default, or 58 legacy channels with `--no-kine
 
 import argparse
 import itertools
-import json
 import os
 import sys
 import time
