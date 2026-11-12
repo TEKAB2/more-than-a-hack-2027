@@ -283,9 +283,45 @@ def kinematic_duel_and_boundary_channels(f, blocks, pitch):
     return sym_kin, anti_kin
 
 
+def carrier_and_imputation_channels(f):
+    """24 explicit channels from physics-reconstructed missing ball and 22-player carrier attribution:
+      - sym_carrier (10 columns, invariant under H <-> A swap):
+          0. sigma_b_norm           : log1p(sigma_b(t)) / log1p(15.0) in [0, 1]
+          1. speed_rec_log          : log1p(||v_ball_rec(t)||) continuous across gaps
+          2. tti_min_sym            : log1p(min(TTI_h1, TTI_a1)) along projected ball trajectory
+          3. tti_conflict           : interception duel intensity when both teams arrive simultaneously
+          4. carrier_max_prob       : max_j alpha_j(t) across all 22 players
+          5. same_player_continuity : sum_j alpha_past_j * alpha_fut_j (+/- 0.5 s)
+          6. teammate_pass_sym      : intra-team inter-player pass signature (j != k in same team)
+          7. interception_sym_05    : inter-team turnover signature over +/- 0.5 s
+          8. interception_sym_12    : stabilized inter-team turnover signature over +/- 1.2 s
+          9. carrier_decel_sym      : control braking intensity of the active carrier
+      - anti_carrier (14 columns, negated under H <-> A swap):
+          0. d_rec_diff_1           : tanh((d_a1_rec - d_h1_rec) / 2.5) * w_sigma
+          1. d_rec_diff_2           : tanh((d_a2_rec - d_h2_rec) / 3.5) * w_sigma (2nd support player)
+          2. tti_diff_1             : tanh((TTI_a1 - TTI_h1) / 0.45) * w_sigma
+          3. tti_diff_2             : tanh((TTI_a2 - TTI_h2) / 0.60) * w_sigma
+          4. tti_fut_04             : prospective mean of tti_diff_1 over [t+1, t+11] (+0.4 s)
+          5. carrier_prob_diff      : P_carrier(Home, t) - P_carrier(Away, t) bridged across gaps
+          6. carrier_vel_align_diff : velocity synchronization difference with reconstructed ball
+          7. closing_speed_diff     : approach speed difference towards ball
+          8. ctrl_decel_diff        : signed control braking difference near ball
+          9. same_player_signed     : signed individual carrier continuity (Home - Away)
+         10. teammate_pass_anti     : signed intra-team pass signature (pass_H - pass_A)
+         11. interception_anti_05   : signed turnover signature over +/- 0.5 s (A->H minus H->A)
+         12. interception_anti_12   : signed turnover signature over +/- 1.2 s (A->H minus H->A)
+         13. gap_carrier_own        : smoothed 22-player carrier + TTI ownership across gaps
+    """
+    n = len(f["ball_seen"])
+    if "carrier_sym" in f and "carrier_anti" in f:
+        return f["carrier_sym"].astype(np.float64), f["carrier_anti"].astype(np.float64)
+    return np.zeros((n, 10), dtype=np.float64), np.zeros((n, 14), dtype=np.float64)
+
+
 def seq_features(f, blocks, pitch, ball_evidence=None, dead_variant="stat", team_variant="duel_past",
-                 include_kinematic=True):
-    """Build the feature matrix (n_frames, 78) in float32 (or 58 when `include_kinematic=False`).
+                 include_kinematic=True, include_carrier=True):
+    """Build the feature matrix (n_frames, 102) in float32 (or 78 when `include_carrier=False`,
+    or 58 when `include_kinematic=False`).
 
     Never uses set-piece tags (to avoid bench leakage).
     """
@@ -297,19 +333,25 @@ def seq_features(f, blocks, pitch, ball_evidence=None, dead_variant="stat", team
 
     if include_kinematic:
         sk, ak = kinematic_duel_and_boundary_channels(f, blocks, pitch)  # 8 sym + 12 anti cols
-        X = np.column_stack([Xd, X_sym, sk, Xt, X_anti, ak]).astype(np.float32)
+        if include_carrier:
+            sc, ac = carrier_and_imputation_channels(f)                  # 10 sym + 14 anti cols
+            X = np.column_stack([Xd, X_sym, sk, sc, Xt, X_anti, ak, ac]).astype(np.float32)
+        else:
+            X = np.column_stack([Xd, X_sym, sk, Xt, X_anti, ak]).astype(np.float32)
     else:
         X = np.column_stack([Xd, X_sym, Xt, X_anti]).astype(np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     return X
 
 
-def antisym_mask(n_channels=78):
+def antisym_mask(n_channels=102):
     """Boolean mask (C,) True on channels that negate when swapping Home <-> Away."""
     if n_channels == 58:
         n_sym = 16 + 8
     elif n_channels == 78:
         n_sym = 16 + 8 + 8
+    elif n_channels == 102:
+        n_sym = 16 + 8 + 8 + 10
     else:
         raise ValueError(f"Unsupported channel count for antisym_mask: {n_channels}")
     mask = np.zeros(n_channels, dtype=bool)
@@ -454,7 +496,8 @@ def emissions_from_weights(f, blocks, pitch, ball_evidence, weights):
         ball_evidence,
         dead_variant=weights.get("dead_variant", "stat"),
         team_variant=weights.get("team_variant", "duel_past"),
-        include_kinematic=(n_ch == 78),
+        include_kinematic=(n_ch >= 78),
+        include_carrier=(n_ch == 102),
     )
     out = predict_game_numpy(X, blocks, params)
     if weights.get("tta_swap", True):
