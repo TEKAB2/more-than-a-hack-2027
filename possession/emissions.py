@@ -96,9 +96,16 @@ def compute(f, blocks, tag_prior=None, set_pieces=(), goals=(), params=None, wei
     n = len(f["ball_seen"])
 
     if weights is not None:
-        from possession import model
-        s_team, s_dead = model.emissions(f, blocks, pitch, ball_team_evidence(f, p) / p["w_ball"],
-                                         weights)
+        if weights.get("kind") == "seq":
+            from possession import seqmodel
+            s_team, s_dead, _ = seqmodel.emissions_from_weights(
+                f, blocks, pitch, ball_team_evidence(f, p) / p["w_ball"], weights
+            )
+        else:
+            from possession import model
+            s_team, s_dead = model.emissions(
+                f, blocks, pitch, ball_team_evidence(f, p) / p["w_ball"], weights
+            )
         s_team = s_team.copy()
         s_dead = s_dead.copy()
     else:

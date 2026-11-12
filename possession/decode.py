@@ -28,9 +28,9 @@ def log_emissions(s_team, s_dead):
     return np.stack([log_alive + log_home, log_alive + log_away, log_dead], axis=1)
 
 
-def viterbi(log_em, costs=None):
+def viterbi(log_em, costs=None, change_bonus=None):
     c = dict(COSTS, **(costs or {}))
-    trans = np.array([
+    trans_base = np.array([
         [0.0, -c["switch"], -c["to_dead"]],
         [-c["switch"], 0.0, -c["to_dead"]],
         [-c["restart"], -c["restart"], 0.0],
@@ -38,11 +38,23 @@ def viterbi(log_em, costs=None):
     n = len(log_em)
     back = np.zeros((n, 3), dtype=np.int8)
     score = log_em[0].astype(np.float64).copy()
-    for t in range(1, n):
-        cand = score[:, None] + trans          # cand[i, j]: come from i into j
-        best = cand.argmax(axis=0)
-        back[t] = best
-        score = cand[best, np.arange(3)] + log_em[t]
+    if change_bonus is None:
+        for t in range(1, n):
+            cand = score[:, None] + trans_base          # cand[i, j]: come from i into j
+            best = cand.argmax(axis=0)
+            back[t] = best
+            score = cand[best, np.arange(3)] + log_em[t]
+    else:
+        bonus = np.asarray(change_bonus, dtype=np.float64)
+        for t in range(1, n):
+            trans = trans_base.copy()
+            sw = max(0.0, c["switch"] - bonus[t])
+            trans[0, 1] = -sw
+            trans[1, 0] = -sw
+            cand = score[:, None] + trans
+            best = cand.argmax(axis=0)
+            back[t] = best
+            score = cand[best, np.arange(3)] + log_em[t]
     path = np.empty(n, dtype=np.int8)
     path[-1] = int(score.argmax())
     for t in range(n - 1, 0, -1):
@@ -50,12 +62,13 @@ def viterbi(log_em, costs=None):
     return path
 
 
-def decode(s_team, s_dead, blocks, n_frames, costs=None):
+def decode(s_team, s_dead, blocks, n_frames, costs=None, change_bonus=None):
     """Label array (n_frames,) of 'H'/'A'/'D', 'X' outside the graded half blocks."""
     labels = np.full(n_frames, "X", dtype="<U1")
     log_em = log_emissions(s_team.astype(np.float64), s_dead.astype(np.float64))
     for _, first, last in blocks:
-        path = viterbi(log_em[first:last + 1], costs)
+        cb = None if change_bonus is None else change_bonus[first:last + 1]
+        path = viterbi(log_em[first:last + 1], costs, change_bonus=cb)
         labels[first:last + 1] = LETTERS[path]
     return labels
 
