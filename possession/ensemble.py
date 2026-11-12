@@ -185,8 +185,9 @@ def combine_emissions(tree_out=None, seq_out=None, f=None, blocks=(), cfg=None):
             seq_out[0], (dict, list, tuple)
         ):
             unpacked = [_unpack_one(x) for x in seq_out]
-            s_st = pool_seed_logits([u[0] for u in unpacked if u[0] is not None])
-            s_sd = pool_seed_logits([u[1] for u in unpacked if u[1] is not None])
+            seq_w = c.get("seq_model_weights")
+            s_st = pool_seed_logits([u[0] for u in unpacked if u[0] is not None], weights=seq_w)
+            s_sd = pool_seed_logits([u[1] for u in unpacked if u[1] is not None], weights=seq_w)
             pcs = [u[2] for u in unpacked if u[2] is not None]
             if pcs:
                 s_pc = pool_change_probs(

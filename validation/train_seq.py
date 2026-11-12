@@ -20,6 +20,7 @@ boundary channels (78 channels by default, or 58 legacy channels with `--no-kine
 
 import argparse
 import itertools
+import json
 import os
 import sys
 import time
@@ -236,26 +237,38 @@ def make_block_targets(labels_seg, sharp_change=True, max_offset=15):
 
 
 def kinematic_snap_signal(f, blocks, pitch):
-    """Sub-second physical contact / deflection / gap-transfer cue in [0, 1.5] per frame."""
+    """Sub-second physical contact / deflection / gap-transfer / 22p-interception cue in [0, 1.5] per frame."""
     sk, _ = seqmodel.kinematic_duel_and_boundary_channels(f, blocks, pitch)
+    sc, _ = seqmodel.carrier_and_imputation_channels(f)
     ctrl_edge = np.zeros(len(f["control"]), dtype=np.float32)
     ctrl_edge[1:] = (f["control"][1:] != f["control"][:-1]).astype(np.float32)
+    # sc[:, 7] is interception_sym_05, sc[:, 5] is same_player_continuity, sc[:, 9] is carrier_decel_sym
+    inter_cue = sc[:, 7].astype(np.float32) * np.clip(1.0 - sc[:, 5].astype(np.float32), 0.2, 1.0)
     return np.clip(
-        0.6 * (f["touch"] != 0).astype(np.float32)
-        + 0.3 * ctrl_edge
-        + 0.5 * sk[:, 1].astype(np.float32)
+        0.55 * (f["touch"] != 0).astype(np.float32)
+        + 0.25 * ctrl_edge
+        + 0.45 * sk[:, 1].astype(np.float32)
         + 0.25 * np.tanh(sk[:, 3].astype(np.float32) / 2.0)
-        + 0.4 * sk[:, 7].astype(np.float32),
+        + 0.35 * sk[:, 7].astype(np.float32)
+        + 0.45 * inter_cue
+        + 0.20 * sc[:, 9].astype(np.float32),
         0.0,
         1.5,
     ).astype(np.float32)
 
 
-def build_seq_rows(samples, seeds, cache_dir=None, games_filter=None, include_kinematic=True, include_carrier=False):
+def _channel_tag(include_kinematic=True, include_carrier=True):
+    if not include_kinematic:
+        return "58ch"
+    return "102ch" if include_carrier else "78ch"
+
+
+def build_seq_rows(samples, seeds, cache_dir=None, games_filter=None, include_kinematic=True,
+                   include_carrier=True):
     """Build feature matrices and targets for each (game, seed)."""
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
-    tag = "102ch" if (include_kinematic and include_carrier) else ("78ch" if include_kinematic else "58ch")
+    tag = _channel_tag(include_kinematic, include_carrier)
     rows = []
     for seed in seeds:
         prepared = E.prepare(samples, seed=seed)
@@ -279,8 +292,14 @@ def build_seq_rows(samples, seeds, cache_dir=None, games_filter=None, include_ki
             else:
                 ev = emissions.ball_team_evidence(f, emissions.PARAMS) / emissions.PARAMS["w_ball"]
                 X = seqmodel.seq_features(
-                    f, blocks, E.PITCH, ev, "stat", "duel_past",
-                    include_kinematic=include_kinematic, include_carrier=include_carrier
+                    f,
+                    blocks,
+                    E.PITCH,
+                    ev,
+                    "stat",
+                    "duel_past",
+                    include_kinematic=include_kinematic,
+                    include_carrier=include_carrier,
                 )
                 sk_snap = kinematic_snap_signal(f, blocks, E.PITCH)
                 if cache_file:
@@ -305,14 +324,15 @@ def build_seq_rows(samples, seeds, cache_dir=None, games_filter=None, include_ki
     return rows
 
 
-def build_pff_rows(pff_dir=E.IDSSE_DIR, seeds=(0, 1), cache_dir=None, max_games=None, include_kinematic=True, include_carrier=False):
+def build_pff_rows(pff_dir=E.IDSSE_DIR, seeds=(0, 1), cache_dir=None, max_games=None,
+                   include_kinematic=True, include_carrier=True):
     """Load converted PFF FC World Cup 2022 `.npz` files (`pff_*.npz`), degrade them like the ATD,
-    and compute/cache the 102-channel, 78-channel, or 58-channel MS-TCN inputs and targets."""
+    and compute/cache the 102-channel (or 78/58-channel) MS-TCN inputs and targets."""
     if not pff_dir or not os.path.isdir(pff_dir):
         return []
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
-    tag = "102ch" if (include_kinematic and include_carrier) else ("78ch" if include_kinematic else "58ch")
+    tag = _channel_tag(include_kinematic, include_carrier)
     pff_files = sorted(
         f for f in os.listdir(pff_dir) if f.startswith("pff_") and f.endswith(".npz")
     )
@@ -339,8 +359,14 @@ def build_pff_rows(pff_dir=E.IDSSE_DIR, seeds=(0, 1), cache_dir=None, max_games=
                 f = features.compute(atd, blocks, E.PITCH)
                 ev = emissions.ball_team_evidence(f, emissions.PARAMS) / emissions.PARAMS["w_ball"]
                 X = seqmodel.seq_features(
-                    f, blocks, E.PITCH, ev, "stat", "duel_past",
-                    include_kinematic=include_kinematic, include_carrier=include_carrier
+                    f,
+                    blocks,
+                    E.PITCH,
+                    ev,
+                    "stat",
+                    "duel_past",
+                    include_kinematic=include_kinematic,
+                    include_carrier=include_carrier,
                 )
                 if cache_file:
                     np.savez(cache_file, X=X)
@@ -789,13 +815,15 @@ def main():
     parser.add_argument("--steps", type=int, default=3000, help="Training steps per fold")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=1200)
-    parser.add_argument("--no-kinematic", action="store_true", help="Use legacy 58-channel inputs instead of 78 kinematic channels")
-    parser.add_argument("--carrier", action="store_true", help="Include 24 physics ball-imputation + 22-player carrier channels (102 channels total)")
+    parser.add_argument("--no-kinematic", action="store_true", help="Use legacy 58-channel inputs instead of kinematic channels")
+    parser.add_argument("--no-carrier", action="store_true", help="Use 78-channel inputs without 22-player carrier/imputation channels")
+    parser.add_argument("--carrier", action="store_true", help="Explicitly enable 102-channel inputs (enabled by default unless --no-carrier)")
     parser.add_argument("--segment-iou", action="store_true", help="Train 6-head MS-TCN with Segment Soft-IoU, Anti-Fragmentation, and Boundary-Offset Regression")
     parser.add_argument("--pretrain-steps", type=int, default=0, help="Phase 1 universal pre-training steps on all PFF FC matches (0 = disabled)")
     parser.add_argument("--finetune-steps", type=int, default=1200, help="Phase 2 domain-adapted fine-tuning steps per fold & seed")
     parser.add_argument("--model-seeds", type=int, default=1, help="Number of distinct MS-TCN training seeds per fold")
     parser.add_argument("--pff-ratio", type=float, default=0.30, help="PFF sampling ratio during Phase 2 fine-tuning (default: 0.30)")
+    parser.add_argument("--reuse-checkpoints", action="store_true", help="Reuse cached fold model checkpoints if present")
     parser.add_argument("--cache-dir", default=os.path.join(ROOT, "cache", "seq_features"))
     parser.add_argument("--save-oof", default=None, help="Save out-of-fold MS-TCN predictions to .npz")
     parser.add_argument("--write-weights", action="store_true", help="Fit final model on all games and write possession/weights*.json")
@@ -807,13 +835,21 @@ def main():
     torch.set_num_threads(max(1, os.cpu_count() or 4))
 
     include_kin = not args.no_kinematic
-    include_car = bool(args.carrier)
+    include_car = include_kin and (args.carrier or not args.no_carrier)
+    ch_tag = _channel_tag(include_kin, include_car)
     n_seeds = max(args.train_seeds, args.eval_seeds)
-    print(f"Building/loading degraded bench features for {n_seeds} seeds (kinematic={include_kin}, carrier={include_car})...", flush=True)
+    print(
+        f"Building/loading degraded bench features for {n_seeds} seeds "
+        f"(channels={ch_tag}, kinematic={include_kin}, carrier={include_car})...",
+        flush=True,
+    )
     t_build0 = time.time()
     all_rows = build_seq_rows(
-        args.samples, tuple(range(n_seeds)), cache_dir=args.cache_dir,
-        include_kinematic=include_kin, include_carrier=include_car,
+        args.samples,
+        tuple(range(n_seeds)),
+        cache_dir=args.cache_dir,
+        include_kinematic=include_kin,
+        include_carrier=include_car,
     )
     print(f"Bench features ready in {time.time() - t_build0:.1f}s ({len(all_rows)} game-seed rows).", flush=True)
 
@@ -864,7 +900,7 @@ def main():
 
     oof_seq_map = {}
     oof_tree_map = {}
-    ch_tag = "102ch" if (include_kin and include_car) else ("78ch" if include_kin else "58ch")
+    ch_tag = _channel_tag(include_kin, include_car)
     pff_tag = f"_64pff_ms{args.model_seeds}" if args.pretrain_steps > 0 else ("_pff" if args.use_pff else "")
 
     # Phase 1: Universal PFF FC Pre-training (100% disjoint from all 10 bench games)
@@ -944,43 +980,47 @@ def main():
                 f"mstcn_{ch_tag}{pff_tag}_{fold_label}_mseed{ms_i}.npz" if n_m_seeds > 1
                 else f"mstcn_{ch_tag}{pff_tag}_{fold_label}.npz",
             )
-            t_train0 = time.time()
-            if pretrain_params is not None:
-                params = train_mstcn(
-                    train_rows,
-                    steps=args.finetune_steps,
-                    batch_size=args.batch_size,
-                    seq_len=args.seq_len,
-                    lr=7e-4,
-                    seed=42 + fold_idx * 10 + ms_i,
-                    swap_aug=True,
-                    edge_aware_smooth=include_kin,
-                    use_segment_iou=args.segment_iou,
-                    init_params=pretrain_params,
-                    pff_sample_ratio=args.pff_ratio,
-                    ema_decay=0.995,
-                )
+            if args.reuse_checkpoints and os.path.exists(fold_npz):
+                params = seqmodel.load_seq_params(fold_npz)
+                print(f"Loaded cached fold checkpoint -> {os.path.relpath(fold_npz, ROOT)}", flush=True)
             else:
-                params = train_mstcn(
-                    train_rows,
-                    steps=args.steps,
-                    batch_size=args.batch_size,
-                    seq_len=args.seq_len,
-                    lr=1.5e-3,
-                    seed=42 + fold_idx * 10 + ms_i,
-                    swap_aug=True,
-                    edge_aware_smooth=include_kin,
-                    use_segment_iou=args.segment_iou,
-                    pff_sample_ratio=(args.pff_ratio if pff_rows else None),
-                    ema_decay=0.995,
+                t_train0 = time.time()
+                if pretrain_params is not None:
+                    params = train_mstcn(
+                        train_rows,
+                        steps=args.finetune_steps,
+                        batch_size=args.batch_size,
+                        seq_len=args.seq_len,
+                        lr=7e-4,
+                        seed=42 + fold_idx * 10 + ms_i,
+                        swap_aug=True,
+                        edge_aware_smooth=include_kin,
+                        use_segment_iou=args.segment_iou,
+                        init_params=pretrain_params,
+                        pff_sample_ratio=args.pff_ratio,
+                        ema_decay=0.995,
+                    )
+                else:
+                    params = train_mstcn(
+                        train_rows,
+                        steps=args.steps,
+                        batch_size=args.batch_size,
+                        seq_len=args.seq_len,
+                        lr=1.5e-3,
+                        seed=42 + fold_idx * 10 + ms_i,
+                        swap_aug=True,
+                        edge_aware_smooth=include_kin,
+                        use_segment_iou=args.segment_iou,
+                        pff_sample_ratio=(args.pff_ratio if pff_rows else None),
+                        ema_decay=0.995,
+                    )
+                train_dur = time.time() - t_train0
+                np.savez(fold_npz, **params)
+                print(
+                    f"Fold {fold_label} (seed {ms_i + 1}/{n_m_seeds}) training completed in "
+                    f"{train_dur:.1f}s ({train_dur / 60.0:.2f} min) -> {os.path.relpath(fold_npz, ROOT)}",
+                    flush=True,
                 )
-            train_dur = time.time() - t_train0
-            np.savez(fold_npz, **params)
-            print(
-                f"Fold {fold_label} (seed {ms_i + 1}/{n_m_seeds}) training completed in "
-                f"{train_dur:.1f}s ({train_dur / 60.0:.2f} min) -> {os.path.relpath(fold_npz, ROOT)}",
-                flush=True,
-            )
             seed_outs_list.append(precompute_seq_outputs(test_rows_eval, params, tta_swap=True))
 
         # 3. Pool multi-seed MS-TCN outputs on test fold
@@ -1084,7 +1124,7 @@ def main():
 
         if args.save_oof:
             save_dict = {}
-            for r, out in zip(evaluated_rows, oof_seq_list):
+            for r, out, (lt, ld) in zip(evaluated_rows, oof_seq_list, oof_tree_list):
                 prefix = f"{r['name']}_seed{r['seed']}"
                 save_dict[f"{prefix}_s_team"] = out["s_team_raw"]
                 save_dict[f"{prefix}_s_dead"] = out["s_dead_raw"]
@@ -1092,8 +1132,10 @@ def main():
                 save_dict[f"{prefix}_p_dead_edge"] = out["p_dead_edge"]
                 if "delta_t" in out:
                     save_dict[f"{prefix}_delta_t"] = out["delta_t"]
+                save_dict[f"{prefix}_tree_team"] = lt.astype(np.float32)
+                save_dict[f"{prefix}_tree_dead"] = ld.astype(np.float32)
             np.savez_compressed(args.save_oof, **save_dict)
-            print(f"Saved OOF MS-TCN predictions -> {args.save_oof}", flush=True)
+            print(f"Saved OOF MS-TCN + GBDT predictions -> {args.save_oof}", flush=True)
 
         std_setting = {"switch": 22.0, "to_dead": 60.0, "restart": 60.0, "t_team": 0.7, "t_dead": 0.7}
         s1 = summarize_scores(evaluate_seq(evaluated_rows, oof_seq_list, std_setting), evaluated_rows)

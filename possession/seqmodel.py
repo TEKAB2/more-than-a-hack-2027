@@ -319,8 +319,9 @@ def carrier_and_imputation_channels(f):
 
 
 def seq_features(f, blocks, pitch, ball_evidence=None, dead_variant="stat", team_variant="duel_past",
-                 include_kinematic=True, include_carrier=False):
-    """Build the feature matrix (n_frames, 102 or 78 or 58) in float32.
+                 include_kinematic=True, include_carrier=True):
+    """Build the feature matrix (n_frames, 102) in float32 (or 78 when `include_carrier=False`,
+    or 58 when `include_kinematic=False`).
 
     Never uses set-piece tags (to avoid bench leakage).
     """
@@ -343,7 +344,7 @@ def seq_features(f, blocks, pitch, ball_evidence=None, dead_variant="stat", team
     return X
 
 
-def antisym_mask(n_channels=78):
+def antisym_mask(n_channels=102):
     """Boolean mask (C,) True on channels that negate when swapping Home <-> Away."""
     if n_channels == 58:
         n_sym = 16 + 8
@@ -521,7 +522,10 @@ def emissions_from_weights(f, blocks, pitch, ball_evidence, weights):
             "delta_t": 0.5 * (out["delta_t"] + out_swap["delta_t"]),
         }
     weights["_last_p_dead_edge"] = out["p_dead_edge"]
-    weights["_last_delta_t"] = out["delta_t"]
+    if int(params["stage2.out_proj.bias"].shape[0]) >= 6:
+        weights["_last_delta_t"] = out["delta_t"]
+    else:
+        weights.pop("_last_delta_t", None)
     s_team = (out["s_team_raw"] * float(weights.get("t_team", 1.0))).astype(np.float32)
     s_dead = (out["s_dead_raw"] * float(weights.get("t_dead", 1.0))).astype(np.float32)
     return s_team, s_dead, out["p_change"]
