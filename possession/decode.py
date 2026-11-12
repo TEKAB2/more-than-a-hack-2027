@@ -166,8 +166,16 @@ def viterbi(log_em, costs=None, change_bonus=None, p_change=None, s_team=None):
     return path
 
 
-def decode(s_team, s_dead, blocks, n_frames, costs=None, change_bonus=None, p_change=None):
-    """Label array (n_frames,) of 'H'/'A'/'D', 'X' outside the graded half blocks."""
+def decode(s_team, s_dead, blocks, n_frames, costs=None, change_bonus=None, p_change=None,
+           p_dead_edge=None, delta_t=None, sk_snap=None):
+    """Label array (n_frames,) of 'H'/'A'/'D', 'X' outside the graded half blocks.
+    When `costs.get('decoder') == 'semi_markov'`, delegates to `segment_decode.decode_segments`."""
+    if isinstance(costs, dict) and costs.get("decoder") == "semi_markov":
+        from possession import segment_decode
+        return segment_decode.decode_segments(
+            s_team, s_dead, blocks, n_frames, costs=costs, p_change=p_change,
+            p_dead_edge=p_dead_edge, delta_t=delta_t, sk_snap=sk_snap,
+        )
     labels = np.full(n_frames, "X", dtype="<U1")
     st64 = s_team.astype(np.float64)
     log_em = log_emissions(st64, s_dead.astype(np.float64))

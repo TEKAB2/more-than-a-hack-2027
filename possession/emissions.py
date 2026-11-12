@@ -107,10 +107,16 @@ def compute(f, blocks, tag_prior=None, set_pieces=(), goals=(), params=None, wei
             s_team_t, s_dead_t = model.emissions(f, blocks, pitch, ev, weights["tree_weights"])
             seq_plist = weights.get("seq_params_list") or [weights["seq_params"]]
             seq_outs = []
+            pde_list = []
+            dt_list = []
             for sp in seq_plist:
                 w_sub = dict(weights, seq_params=sp, t_team=1.0, t_dead=1.0)
                 st_s, sd_s, pc_s = seqmodel.emissions_from_weights(f, blocks, pitch, ev, w_sub)
                 seq_outs.append({"s_team": st_s, "s_dead": sd_s, "p_change": pc_s})
+                if "_last_p_dead_edge" in w_sub:
+                    pde_list.append(w_sub["_last_p_dead_edge"])
+                if "_last_delta_t" in w_sub:
+                    dt_list.append(w_sub["_last_delta_t"])
             s_team, s_dead, p_chg = ensemble.combine_emissions(
                 tree_out=(s_team_t, s_dead_t),
                 seq_out=seq_outs,
@@ -119,6 +125,10 @@ def compute(f, blocks, tag_prior=None, set_pieces=(), goals=(), params=None, wei
                 cfg=weights.get("ensemble", {}),
             )
             weights["_last_p_change"] = p_chg
+            if pde_list:
+                weights["_last_p_dead_edge"] = np.mean(pde_list, axis=0).astype(np.float32)
+            if dt_list:
+                weights["_last_delta_t"] = np.mean(dt_list, axis=0).astype(np.float32)
         else:
             from possession import model
             s_team, s_dead = model.emissions(

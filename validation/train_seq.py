@@ -100,6 +100,7 @@ class MSTCN(nn.Module):
     def __init__(
         self,
         in_channels=78,
+        out_heads=6,
         s1_channels=seqmodel.STAGE1_CHANNELS,
         s1_dilations=seqmodel.STAGE1_DILATIONS,
         s2_channels=seqmodel.STAGE2_CHANNELS,
@@ -108,8 +109,9 @@ class MSTCN(nn.Module):
         dropout=0.15,
     ):
         super().__init__()
-        self.stage1 = TCNStage(in_channels, s1_channels, 5, s1_dilations, kernel_size, dropout)
-        self.stage2 = TCNStage(5, s2_channels, 5, s2_dilations, kernel_size, dropout)
+        self.out_heads = out_heads
+        self.stage1 = TCNStage(in_channels, s1_channels, out_heads, s1_dilations, kernel_size, dropout)
+        self.stage2 = TCNStage(out_heads, s2_channels, out_heads, s2_dilations, kernel_size, dropout)
 
     def forward(self, x):
         # x: (B, C, T)
@@ -117,7 +119,11 @@ class MSTCN(nn.Module):
         probs_had = F.softmax(logits1[:, :3, :], dim=1)
         prob_chg = torch.sigmoid(logits1[:, 3:4, :])
         prob_de = torch.sigmoid(logits1[:, 4:5, :])
-        s2_in = torch.cat([probs_had, prob_chg, prob_de], dim=1)
+        if self.out_heads >= 6:
+            off1 = torch.tanh(logits1[:, 5:6, :])
+            s2_in = torch.cat([probs_had, prob_chg, prob_de, off1], dim=1)
+        else:
+            s2_in = torch.cat([probs_had, prob_chg, prob_de], dim=1)
         logits2 = self.stage2(s2_in)
         return logits1, logits2
 
@@ -170,12 +176,14 @@ def _gaussian_targets(events_idx, length, sigma=4.0, radius=12):
     return y
 
 
-def make_block_targets(labels_seg, sharp_change=True):
+def make_block_targets(labels_seg, sharp_change=True, max_offset=15):
     """Build per-frame targets for one contiguous half block:
       - y_had: (T,) int64 in {0: H, 1: A, 2: D, -1: X}
       - w_had: (T,) float32 possession-duration weights (short possessions weighted up)
       - y_chg: (T,) float32 soft label in [0, 1] around H <-> A switches
       - y_de:  (T,) float32 soft label in [0, 1] around alive <-> D transitions
+      - y_off: (T,) float32 signed offset `(t_nearest_chg - t) / max_offset` in [-1, 1]
+      - m_off: (T,) float32 Gaussian mask around H <-> A transitions for offset regression
     """
     n = len(labels_seg)
     y_had = np.full(n, -1, dtype=np.int64)
@@ -209,7 +217,23 @@ def make_block_targets(labels_seg, sharp_change=True):
     else:
         y_chg = _gaussian_targets(team_chg, n, sigma=4.0, radius=12)
     y_de = _gaussian_targets(dead_edge, n, sigma=5.0, radius=15)
-    return y_had, w_had, y_chg, y_de
+
+    y_off = np.zeros(n, dtype=np.float32)
+    m_off = np.zeros(n, dtype=np.float32)
+    if team_chg:
+        tc_arr = np.asarray(team_chg, dtype=np.int64)
+        idx = np.arange(n, dtype=np.int64)
+        pos = np.searchsorted(tc_arr, idx)
+        left = np.clip(pos - 1, 0, len(tc_arr) - 1)
+        right = np.clip(pos, 0, len(tc_arr) - 1)
+        d_left = tc_arr[left] - idx
+        d_right = tc_arr[right] - idx
+        delta = np.where(np.abs(d_left) <= np.abs(d_right), d_left, d_right)
+        near = np.abs(delta) <= max_offset
+        y_off[near] = np.clip(delta[near] / float(max_offset), -1.0, 1.0)
+        m_off[near] = np.exp(-0.5 * (delta[near] / 8.0) ** 2).astype(np.float32)
+
+    return y_had, w_had, y_chg, y_de, y_off, m_off
 
 
 def kinematic_snap_signal(f, blocks, pitch):
@@ -340,12 +364,14 @@ def build_pff_rows(pff_dir=E.IDSSE_DIR, seeds=(0, 1), cache_dir=None, max_games=
 
 
 # ------------------------------------------------------------------------- Loss & Training
-def stage_loss(logits, y_had, w_had, y_chg, y_de, pos_weight_chg=10.0, pos_weight_de=8.0,
-               smooth_w=0.18, edge_aware_smooth=True):
+def stage_loss(logits, y_had, w_had, y_chg, y_de, y_off=None, m_off=None,
+               pos_weight_chg=10.0, pos_weight_de=8.0, smooth_w=0.18,
+               edge_aware_smooth=True, use_segment_iou=False):
     """Combined multi-task loss for one MS-TCN stage.
-    When `edge_aware_smooth=True`, temporal smoothing is gated by `1 - max(y_chg, y_de)` so sharp
-    transitions at true possession boundaries are never penalized while duels inside possessions
-    are strongly smoothed.
+    When `use_segment_iou=True`, adds:
+      - Windowed Soft-IoU (Jaccard) loss on H, A, D probabilities (`loss_iou`),
+      - Continuous Boundary-Offset Regression loss (`SmoothL1(tanh(logit_off), y_off)`),
+      - Intra-Possession Anti-Fragmentation Margin penalty (`loss_frag`).
     """
     logits_had = logits[:, :3, :]  # (B, 3, T)
     logit_chg = logits[:, 3, :]    # (B, T)
@@ -354,7 +380,8 @@ def stage_loss(logits, y_had, w_had, y_chg, y_de, pos_weight_chg=10.0, pos_weigh
     valid = (y_had >= 0).float()
     y_clamped = torch.clamp(y_had, min=0)
     ce = F.cross_entropy(logits_had, y_clamped, reduction="none")  # (B, T)
-    loss_had = (ce * w_had * valid).sum() / torch.clamp((w_had * valid).sum(), min=1.0)
+    w_eff = torch.clamp(w_had, max=2.5) if use_segment_iou else w_had
+    loss_had = (ce * w_eff * valid).sum() / torch.clamp((w_eff * valid).sum(), min=1.0)
 
     pw_c = torch.tensor(pos_weight_chg, dtype=logits.dtype, device=logits.device)
     pw_d = torch.tensor(pos_weight_de, dtype=logits.dtype, device=logits.device)
@@ -373,11 +400,40 @@ def stage_loss(logits, y_had, w_had, y_chg, y_de, pos_weight_chg=10.0, pos_weigh
         smooth = diff_sq.mean()
         w_c = 0.35
 
-    return loss_had + w_c * loss_chg + 0.25 * loss_de + smooth_w * smooth
+    total = loss_had + w_c * loss_chg + 0.25 * loss_de + smooth_w * smooth
+
+    if use_segment_iou:
+        probs = F.softmax(logits_had, dim=1)
+        one_hot = F.one_hot(y_clamped, num_classes=3).permute(0, 2, 1).float() * valid.unsqueeze(1)
+        B_sz, _, T_len = probs.shape
+        n_win = 6
+        w_len = T_len // n_win
+        p_w = probs[:, :3, :n_win * w_len].reshape(B_sz, 3, n_win, w_len)
+        g_w = one_hot[:, :3, :n_win * w_len].reshape(B_sz, 3, n_win, w_len)
+        inter = (p_w * g_w).sum(dim=-1)
+        union = p_w.sum(dim=-1) + g_w.sum(dim=-1) - inter
+        valid_win = (g_w.sum(dim=-1) > 5.0).float()
+        soft_iou = (inter + 1.0) / (union + 1.0)
+        loss_iou = ((1.0 - soft_iou) * valid_win).sum() / torch.clamp(valid_win.sum(), min=1.0)
+
+        interior_h = ((y_had == 0) & (y_chg < 0.05)).float()
+        interior_a = ((y_had == 1) & (y_chg < 0.05)).float()
+        s_team = logits_had[:, 0, :] - logits_had[:, 1, :]
+        frag_pen = interior_h * F.relu(0.5 - s_team).pow(2) + interior_a * F.relu(0.5 + s_team).pow(2)
+        loss_frag = frag_pen.sum() / torch.clamp((interior_h + interior_a).sum(), min=1.0)
+        total = total + 0.30 * loss_iou + 0.15 * loss_frag
+
+        if logits.shape[1] >= 6 and y_off is not None and m_off is not None:
+            pred_off = torch.tanh(logits[:, 5, :])
+            off_err = F.smooth_l1_loss(pred_off, y_off, reduction="none", beta=0.1)
+            loss_off = (off_err * m_off * valid).sum() / torch.clamp((m_off * valid).sum(), min=1.0)
+            total = total + 0.50 * loss_off
+
+    return total
 
 
 def train_mstcn(train_rows, steps=3000, batch_size=4, seq_len=1200, lr=1.5e-3, seed=42,
-                swap_aug=True, edge_aware_smooth=True):
+                swap_aug=True, edge_aware_smooth=True, use_segment_iou=False):
     """Fit the 2-stage MS-TCN on `train_rows` with fixed random seed."""
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -388,7 +444,9 @@ def train_mstcn(train_rows, steps=3000, batch_size=4, seq_len=1200, lr=1.5e-3, s
     for r in train_rows:
         for (_, lo, hi), bt in zip(r["blocks"], r["block_targets"]):
             x_seg = r["X"][lo:hi + 1]
-            segments.append((x_seg, bt[0], bt[1], bt[2], bt[3]))
+            yo = bt[4] if len(bt) >= 6 else np.zeros(len(x_seg), dtype=np.float32)
+            mo = bt[5] if len(bt) >= 6 else np.zeros(len(x_seg), dtype=np.float32)
+            segments.append((x_seg, bt[0], bt[1], bt[2], bt[3], yo, mo))
             all_x.append(x_seg[::10])
     cat_x = np.vstack(all_x).astype(np.float64)
     norm_mu = cat_x.mean(axis=0).astype(np.float32)
@@ -399,12 +457,13 @@ def train_mstcn(train_rows, steps=3000, batch_size=4, seq_len=1200, lr=1.5e-3, s
     norm_mu[anti_mask] = 0.0
 
     norm_segments = []
-    for x_seg, yh, wh, yc, yd in segments:
+    for x_seg, yh, wh, yc, yd, yo, mo in segments:
         xn = ((x_seg - norm_mu[None, :]) / norm_sd[None, :]).astype(np.float32)
-        norm_segments.append((xn, yh, wh, yc, yd))
+        norm_segments.append((xn, yh, wh, yc, yd, yo, mo))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = MSTCN(in_channels=n_channels).to(device)
+    out_heads = 6 if use_segment_iou else 5
+    net = MSTCN(in_channels=n_channels, out_heads=out_heads).to(device)
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=1e-4)
 
@@ -421,10 +480,12 @@ def train_mstcn(train_rows, steps=3000, batch_size=4, seq_len=1200, lr=1.5e-3, s
         bw_had = np.empty((batch_size, seq_len), dtype=np.float32)
         by_chg = np.empty((batch_size, seq_len), dtype=np.float32)
         by_de = np.empty((batch_size, seq_len), dtype=np.float32)
+        by_off = np.empty((batch_size, seq_len), dtype=np.float32)
+        bm_off = np.empty((batch_size, seq_len), dtype=np.float32)
 
         chosen = rng.choice(len(norm_segments), size=batch_size, p=seg_weights)
         for b_i, s_i in enumerate(chosen):
-            xn, yh, wh, yc, yd = norm_segments[s_i]
+            xn, yh, wh, yc, yd, yo, mo = norm_segments[s_i]
             m = len(xn)
             if m > seq_len:
                 start = int(rng.integers(0, m - seq_len))
@@ -434,17 +495,23 @@ def train_mstcn(train_rows, steps=3000, batch_size=4, seq_len=1200, lr=1.5e-3, s
                 wh_crop = wh[sl].copy()
                 yc_crop = yc[sl].copy()
                 yd_crop = yd[sl].copy()
+                yo_crop = yo[sl].copy()
+                mo_crop = mo[sl].copy()
             else:
                 x_crop = np.zeros((n_channels, seq_len), dtype=np.float32)
                 yh_crop = np.full(seq_len, -1, dtype=np.int64)
                 wh_crop = np.zeros(seq_len, dtype=np.float32)
                 yc_crop = np.zeros(seq_len, dtype=np.float32)
                 yd_crop = np.zeros(seq_len, dtype=np.float32)
+                yo_crop = np.zeros(seq_len, dtype=np.float32)
+                mo_crop = np.zeros(seq_len, dtype=np.float32)
                 x_crop[:, :m] = xn.T
                 yh_crop[:m] = yh
                 wh_crop[:m] = wh
                 yc_crop[:m] = yc
                 yd_crop[:m] = yd
+                yo_crop[:m] = yo
+                mo_crop[:m] = mo
 
             if swap_aug and rng.random() < 0.5:
                 x_crop[anti_idx, :] = -x_crop[anti_idx, :]
@@ -458,17 +525,27 @@ def train_mstcn(train_rows, steps=3000, batch_size=4, seq_len=1200, lr=1.5e-3, s
             bw_had[b_i] = wh_crop
             by_chg[b_i] = yc_crop
             by_de[b_i] = yd_crop
+            by_off[b_i] = yo_crop
+            bm_off[b_i] = mo_crop
 
         tx = torch.from_numpy(bx).to(device)
         ty_had = torch.from_numpy(by_had).to(device)
         tw_had = torch.from_numpy(bw_had).to(device)
         ty_chg = torch.from_numpy(by_chg).to(device)
         ty_de = torch.from_numpy(by_de).to(device)
+        ty_off = torch.from_numpy(by_off).to(device)
+        tm_off = torch.from_numpy(bm_off).to(device)
 
         optimizer.zero_grad()
         l1, l2 = net(tx)
-        loss1 = stage_loss(l1, ty_had, tw_had, ty_chg, ty_de, edge_aware_smooth=edge_aware_smooth)
-        loss2 = stage_loss(l2, ty_had, tw_had, ty_chg, ty_de, edge_aware_smooth=edge_aware_smooth)
+        loss1 = stage_loss(
+            l1, ty_had, tw_had, ty_chg, ty_de, ty_off, tm_off,
+            edge_aware_smooth=edge_aware_smooth, use_segment_iou=use_segment_iou,
+        )
+        loss2 = stage_loss(
+            l2, ty_had, tw_had, ty_chg, ty_de, ty_off, tm_off,
+            edge_aware_smooth=edge_aware_smooth, use_segment_iou=use_segment_iou,
+        )
         loss = loss1 + loss2
         loss.backward()
         nn.utils.clip_grad_norm_(net.parameters(), 2.0)
@@ -508,6 +585,7 @@ def precompute_seq_outputs(rows, params, tta_swap=True):
                 "s_dead_raw": 0.5 * (out["s_dead_raw"] + out_swap["s_dead_raw"]),
                 "p_change": 0.5 * (out["p_change"] + out_swap["p_change"]),
                 "p_dead_edge": 0.5 * (out["p_dead_edge"] + out_swap["p_dead_edge"]),
+                "delta_t": 0.5 * (out["delta_t"] + out_swap["delta_t"]),
             }
         outputs.append(out)
     return outputs
@@ -663,6 +741,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=1200)
     parser.add_argument("--no-kinematic", action="store_true", help="Use legacy 58-channel inputs instead of 78 kinematic channels")
+    parser.add_argument("--segment-iou", action="store_true", help="Train 6-head MS-TCN with Segment Soft-IoU, Anti-Fragmentation, and Boundary-Offset Regression")
     parser.add_argument("--cache-dir", default=os.path.join(ROOT, "cache", "seq_features"))
     parser.add_argument("--save-oof", default=None, help="Save out-of-fold MS-TCN predictions to .npz")
     parser.add_argument("--write-weights", action="store_true", help="Fit final model on all games and write possession/weights*.json")
@@ -776,6 +855,7 @@ def main():
             seed=42 + fold_idx,
             swap_aug=True,
             edge_aware_smooth=include_kin,
+            use_segment_iou=args.segment_iou,
         )
         train_dur = time.time() - t_train0
         np.savez(fold_npz, **params)
@@ -946,6 +1026,7 @@ def main():
                 seed=100,
                 swap_aug=True,
                 edge_aware_smooth=include_kin,
+                use_segment_iou=args.segment_iou,
             )
             seq_npz_path = os.path.join(os.path.dirname(model.WEIGHTS), "weights_seq.npz")
             np.savez_compressed(seq_npz_path, **final_params)
