@@ -74,7 +74,8 @@ def infer(data_dir=None, game=GAME, params=None, costs=None, use_tagging=True,
         print("emissions: hand-set v1 parameters")
     s_team, s_dead, restarts = emissions.compute(feats, blocks, tag_prior, pieces, goals, params,
                                                  weights, pitch)
-    labels = decode.decode(s_team, s_dead, blocks, n, costs)
+    p_change = weights.get("_last_p_change") if isinstance(weights, dict) else None
+    labels = decode.decode(s_team, s_dead, blocks, n, costs, p_change=p_change)
     return {"labels": labels, "s_team": s_team, "s_dead": s_dead, "restarts": restarts,
             "atd": data, "features": feats, "blocks": blocks, "pitch": pitch,
             "home": home, "away": away, "n": n}

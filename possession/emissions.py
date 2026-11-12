@@ -101,6 +101,24 @@ def compute(f, blocks, tag_prior=None, set_pieces=(), goals=(), params=None, wei
             s_team, s_dead, _ = seqmodel.emissions_from_weights(
                 f, blocks, pitch, ball_team_evidence(f, p) / p["w_ball"], weights
             )
+        elif weights.get("kind") == "ensemble":
+            from possession import ensemble, model, seqmodel
+            ev = ball_team_evidence(f, p) / p["w_ball"]
+            s_team_t, s_dead_t = model.emissions(f, blocks, pitch, ev, weights["tree_weights"])
+            seq_plist = weights.get("seq_params_list") or [weights["seq_params"]]
+            seq_outs = []
+            for sp in seq_plist:
+                w_sub = dict(weights, seq_params=sp, t_team=1.0, t_dead=1.0)
+                st_s, sd_s, pc_s = seqmodel.emissions_from_weights(f, blocks, pitch, ev, w_sub)
+                seq_outs.append({"s_team": st_s, "s_dead": sd_s, "p_change": pc_s})
+            s_team, s_dead, p_chg = ensemble.combine_emissions(
+                tree_out=(s_team_t, s_dead_t),
+                seq_out=seq_outs,
+                f=f,
+                blocks=blocks,
+                cfg=weights.get("ensemble", {}),
+            )
+            weights["_last_p_change"] = p_chg
         else:
             from possession import model
             s_team, s_dead = model.emissions(

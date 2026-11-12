@@ -4,12 +4,15 @@ Pure NumPy inference (no PyTorch dependency at inference time, Python >= 3.8 com
 Weights are stored in `.npz` format alongside `weights.json` (with `kind: "seq"`).
 
 Architecture:
-  - Inputs (~58 channels):
-      * dead_features(..., variant="stat")          [16 cols]
-      * team_features(..., variant="duel_past")     [26 cols]
-      * direct frame signals from features.compute  [16 cols]
-    Split into symmetric channels (dead + unsigned frame signals) and antisymmetric
-    channels (team + signed frame signals, negated under H <-> A swap).
+  - Inputs (78 channels by default, or 58 legacy channels when `include_kinematic=False`):
+      * dead_features(..., variant="stat")                     [16 symmetric cols]
+      * raw_signal_columns(f, blocks, pitch)[0]                [ 8 symmetric cols]
+      * kinematic_duel_and_boundary_channels(...)[0]           [ 8 symmetric cols]
+      * team_features(..., variant="duel_past")                [26 antisymmetric cols]
+      * raw_signal_columns(f, blocks, pitch)[1]                [ 8 antisymmetric cols]
+      * kinematic_duel_and_boundary_channels(...)[1]           [12 antisymmetric cols]
+    Split into 32 symmetric channels (invariant to H <-> A swap) and 46 antisymmetric
+    channels (negated under H <-> A swap). Zero set-piece tag channels (no bench leakage).
   - Stage 1: 1x1 projection -> 6 dilated residual blocks (64 channels, kernel 5, dilations 1..32,
              receptive field +/- 10 s at 25 fps) -> 1x1 head producing 5 logits per frame:
              [logit_H, logit_A, logit_D, logit_change, logit_dead_edge].
@@ -18,7 +21,6 @@ Architecture:
              -> 1x1 head producing refined 5 logits per frame.
 """
 
-import os
 import numpy as np
 
 from possession import emissions as em_mod
@@ -111,8 +113,179 @@ def raw_signal_columns(f, blocks, pitch):
     return np.column_stack(sym_cols), np.column_stack(anti_cols)
 
 
-def seq_features(f, blocks, pitch, ball_evidence=None, dead_variant="stat", team_variant="duel_past"):
-    """Build the full 58-channel feature matrix (n_frames, 58) in float32, plus antisymmetric mask.
+def kinematic_duel_and_boundary_channels(f, blocks, pitch):
+    """20 explicit kinematic duel/deflection and sub-second boundary channels (0 set-piece leakage).
+
+    Returns (sym_kin, anti_kin):
+      - sym_kin (8 columns, invariant under H <-> A swap):
+          0. deflect_norm    : arccos(cos_theta_ball) / pi in [0, 1] over +/- 0.24 s (6 frames)
+          1. cos_contact     : 0.5 * (1 - cos_theta_ball) * contact_proximity in [0, 1]
+          2. impulse         : log1p(||v_out - v_in||) over +/- 0.16 s (4 frames)
+          3. impulse_peak    : impulse / (local_mean_1s + 0.5) * contact_proximity
+          4. speed_ratio     : tanh(log((||v_out|| + 0.3) / (||v_in|| + 0.3)))
+          5. gap_start       : exp(-age_since_ball_lost / 10) inside missing-ball gaps
+          6. gap_end         : exp(-frames_until_ball_seen / 10) inside missing-ball gaps
+          7. transfer_bridge : rate of change of interpolated team ownership inside missing-ball gaps
+      - anti_kin (12 columns, negated under H <-> A swap):
+          0. nt_05           : mean touch sign in [t+1, t+12] (0.5 s ahead)
+          1. nt_10           : mean touch sign in [t+1, t+25] (1.0 s ahead)
+          2. nt_20           : mean touch sign in [t+1, t+50] (2.0 s ahead)
+          3. sign_n          : exponentially decayed sign of the exact first touch strictly after t
+          4. nc_05           : mean control sign in [t+1, t+12] (0.5 s ahead)
+          5. nc_10           : mean control sign in [t+1, t+25] (1.0 s ahead)
+          6. pc_05           : mean control sign in [t-12, t] (0.5 s behind)
+          7. ctrl_diff       : nc_05 - pc_05 (sharp step at reception/recovery)
+          8. sign_l          : exponentially decayed sign of the last touch at or before t
+          9. m_fut05         : mean of tanh((d_away - d_home) / 2.0) in [t+4, t+14] (~0.36 s ahead)
+         10. m_fut08         : mean of tanh((d_away - d_home) / 2.0) in [t+12, t+24] (~0.72 s ahead)
+         11. bridge_team     : linearly interpolated active ownership across missing-ball gaps
+    """
+    n = len(f["ball_seen"])
+    seen = f["ball_seen"]
+    ok = f["ball_ok"]
+    b = f["ball"].astype(np.float64)
+    d_h = f["d_home"].astype(np.float64)
+    d_a = f["d_away"].astype(np.float64)
+    dmin = np.minimum(d_h, d_a)
+    prox = np.where(ok & np.isfinite(dmin), np.clip((3.0 - dmin) / 3.0, 0.0, 1.0), 0.0)
+
+    deflect_norm = np.zeros(n, dtype=np.float64)
+    cos_contact = np.zeros(n, dtype=np.float64)
+    impulse = np.zeros(n, dtype=np.float64)
+    impulse_peak = np.zeros(n, dtype=np.float64)
+    speed_ratio = np.zeros(n, dtype=np.float64)
+    gap_start = np.zeros(n, dtype=np.float64)
+    gap_end = np.zeros(n, dtype=np.float64)
+    transfer_bridge = np.zeros(n, dtype=np.float64)
+    bridge_team = np.zeros(n, dtype=np.float64)
+
+    with np.errstate(invalid="ignore"):
+        margin = np.where(ok & np.isfinite(d_h) & np.isfinite(d_a), np.tanh((d_a - d_h) / 2.0), 0.0)
+
+    c = f["control"].astype(np.float64)
+    t1 = f["touch"].astype(np.float64)
+
+    for _, lo, hi in blocks:
+        sl = slice(lo, hi + 1)
+        bs = b[sl]
+        m = len(bs)
+        pr = prox[sl]
+
+        k = 6
+        if m > 2 * k:
+            vin = bs[k:m - k] - bs[:m - 2 * k]
+            vout = bs[2 * k:] - bs[k:m - k]
+            n_in = np.hypot(vin[:, 0], vin[:, 1])
+            n_out = np.hypot(vout[:, 0], vout[:, 1])
+            valid = (n_in > 0.25) & (n_out > 0.25) & np.isfinite(n_in) & np.isfinite(n_out)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                cos_a = np.where(
+                    valid,
+                    np.clip(
+                        (vin[:, 0] * vout[:, 0] + vin[:, 1] * vout[:, 1])
+                        / np.maximum(n_in * n_out, 1e-6),
+                        -1.0,
+                        1.0,
+                    ),
+                    1.0,
+                )
+            ang = np.arccos(cos_a) / np.pi
+            deflect_norm[lo + k:hi + 1 - k] = ang
+            cos_contact[lo + k:hi + 1 - k] = 0.5 * (1.0 - cos_a) * pr[k:m - k]
+            sr = np.where(
+                np.isfinite(n_in) & np.isfinite(n_out),
+                np.tanh(np.log((n_out + 0.3) / (n_in + 0.3))),
+                0.0,
+            )
+            speed_ratio[lo + k:hi + 1 - k] = sr
+
+        ki = 4
+        if m > 2 * ki:
+            vi = (bs[ki:m - ki] - bs[:m - 2 * ki]) * (FPS / ki)
+            vo = (bs[2 * ki:] - bs[ki:m - ki]) * (FPS / ki)
+            dv = np.hypot(vo[:, 0] - vi[:, 0], vo[:, 1] - vi[:, 1])
+            dv = np.nan_to_num(dv, nan=0.0, posinf=0.0, neginf=0.0)
+            imp = np.log1p(np.clip(dv, 0.0, 60.0))
+            impulse[lo + ki:hi + 1 - ki] = imp
+            imp_full = impulse[sl]
+            mean_imp = np.convolve(imp_full, np.ones(31) / 31.0, mode="same")
+            impulse_peak[sl] = (imp_full / (mean_imp + 0.5)) * pr
+
+        seen_seg = seen[sl]
+        if not np.all(seen_seg):
+            idx_m = np.arange(m)
+            last_s = np.maximum.accumulate(np.where(seen_seg, idx_m, -1))
+            next_s = np.minimum.accumulate(np.where(seen_seg, idx_m, m)[::-1])[::-1]
+            in_gap = ~seen_seg
+            age_lost = np.where(in_gap & (last_s >= 0), idx_m - last_s, 999)
+            rem_lost = np.where(in_gap & (next_s < m), next_s - idx_m, 999)
+            gap_start[sl] = np.where(in_gap, np.exp(-age_lost / 10.0), 0.0)
+            gap_end[sl] = np.where(in_gap, np.exp(-rem_lost / 10.0), 0.0)
+
+        active_sig = np.where(
+            seen_seg, np.clip(0.5 * c[sl] + 0.5 * t1[sl] + 0.5 * margin[sl], -1.0, 1.0), np.nan
+        )
+        valid_sig = np.isfinite(active_sig) & (np.abs(active_sig) > 0.05)
+        if valid_sig.sum() >= 2:
+            idx_m = np.arange(m)
+            interp_sig = np.interp(idx_m, idx_m[valid_sig], active_sig[valid_sig])
+            bridge_team[sl] = interp_sig
+            d_bridge = np.zeros(m, dtype=np.float64)
+            if m > 10:
+                d_bridge[5:-5] = np.abs(interp_sig[10:] - interp_sig[:-10])
+            transfer_bridge[sl] = np.where(~seen_seg, d_bridge, 0.0)
+
+    nt_05 = lin_model._fill(lin_model._shift_mean(t1, 1, 13, blocks, n), 0.0) * 12.0
+    nt_10 = lin_model._fill(lin_model._shift_mean(t1, 1, 26, blocks, n), 0.0) * 12.0
+    nt_20 = lin_model._fill(lin_model._shift_mean(t1, 1, 51, blocks, n), 0.0) * 12.0
+
+    is_t = t1 != 0
+    ni = lin_model._event_index(is_t, blocks, forward=True)
+    li = lin_model._event_index(is_t, blocks, forward=False)
+    idx_all = np.arange(n)
+    age_n = np.where(ni >= 0, (ni - idx_all) / float(FPS), 8.0)
+    age_l = np.where(li >= 0, (idx_all - li) / float(FPS), 8.0)
+    sign_n = np.where((ni >= 0) & (age_n < 6.0), t1[np.maximum(ni, 0)] * np.exp(-age_n / 1.5), 0.0)
+    sign_l = np.where((li >= 0) & (age_l < 6.0), t1[np.maximum(li, 0)] * np.exp(-age_l / 1.5), 0.0)
+
+    nc_05 = lin_model._fill(lin_model._shift_mean(c, 1, 13, blocks, n), 0.0)
+    nc_10 = lin_model._fill(lin_model._shift_mean(c, 1, 26, blocks, n), 0.0)
+    pc_05 = lin_model._fill(lin_model._shift_mean(c, -12, 1, blocks, n), 0.0)
+    ctrl_diff = nc_05 - pc_05
+
+    m_fut05 = lin_model._fill(lin_model._shift_mean(margin, 4, 15, blocks, n), 0.0)
+    m_fut08 = lin_model._fill(lin_model._shift_mean(margin, 12, 25, blocks, n), 0.0)
+
+    sym_kin = np.column_stack([
+        deflect_norm,
+        cos_contact,
+        impulse,
+        impulse_peak,
+        speed_ratio,
+        gap_start,
+        gap_end,
+        transfer_bridge,
+    ])
+    anti_kin = np.column_stack([
+        nt_05,
+        nt_10,
+        nt_20,
+        sign_n,
+        nc_05,
+        nc_10,
+        pc_05,
+        ctrl_diff,
+        sign_l,
+        m_fut05,
+        m_fut08,
+        bridge_team,
+    ])
+    return sym_kin, anti_kin
+
+
+def seq_features(f, blocks, pitch, ball_evidence=None, dead_variant="stat", team_variant="duel_past",
+                 include_kinematic=True):
+    """Build the feature matrix (n_frames, 78) in float32 (or 58 when `include_kinematic=False`).
 
     Never uses set-piece tags (to avoid bench leakage).
     """
@@ -122,15 +295,25 @@ def seq_features(f, blocks, pitch, ball_evidence=None, dead_variant="stat", team
     Xt = lin_model.team_features(f, blocks, pitch, ball_evidence, team_variant)  # 26 antisymmetric cols
     X_sym, X_anti = raw_signal_columns(f, blocks, pitch)                # 8 sym + 8 anti cols
 
-    X = np.column_stack([Xd, X_sym, Xt, X_anti]).astype(np.float32)
+    if include_kinematic:
+        sk, ak = kinematic_duel_and_boundary_channels(f, blocks, pitch)  # 8 sym + 12 anti cols
+        X = np.column_stack([Xd, X_sym, sk, Xt, X_anti, ak]).astype(np.float32)
+    else:
+        X = np.column_stack([Xd, X_sym, Xt, X_anti]).astype(np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     return X
 
 
-def antisym_mask(n_dead=16, n_sym_raw=8, n_team=26, n_anti_raw=8):
-    """Boolean mask (58,) True on channels that negate when swapping Home <-> Away."""
-    mask = np.zeros(n_dead + n_sym_raw + n_team + n_anti_raw, dtype=bool)
-    mask[n_dead + n_sym_raw:] = True
+def antisym_mask(n_channels=78):
+    """Boolean mask (C,) True on channels that negate when swapping Home <-> Away."""
+    if n_channels == 58:
+        n_sym = 16 + 8
+    elif n_channels == 78:
+        n_sym = 16 + 8 + 8
+    else:
+        raise ValueError(f"Unsupported channel count for antisym_mask: {n_channels}")
+    mask = np.zeros(n_channels, dtype=bool)
+    mask[n_sym:] = True
     return mask
 
 
@@ -166,7 +349,6 @@ def _conv1d_dilated(x, weight, bias, dilation):
     """
     c_out, c_in, k = weight.shape
     _, length = x.shape
-    pad = (k // 2) * dilation
     out = np.broadcast_to(bias[:, None], (c_out, length)).astype(np.float32).copy()
     for j in range(k):
         shift = (j - k // 2) * dilation
@@ -174,12 +356,10 @@ def _conv1d_dilated(x, weight, bias, dilation):
         if shift == 0:
             out += w_j @ x
         elif shift < 0:
-            # source index t + shift in [0, length + shift) -> writes to [-shift : length]
             s = -shift
             if s < length:
                 out[:, s:] += w_j @ x[:, :length - s]
         else:
-            # source index t + shift in [shift, length) -> writes to [0 : length - shift]
             if shift < length:
                 out[:, :length - shift] += w_j @ x[:, shift:]
     return out
@@ -264,8 +444,9 @@ def load_seq_params(npz_path):
 
 
 def emissions_from_weights(f, blocks, pitch, ball_evidence, weights):
-    """Compute (s_team, s_dead) and optional dynamic change bonus from `weights` with kind=='seq'."""
+    """Compute (s_team, s_dead, p_change) from `weights` with kind=='seq'."""
     params = weights["seq_params"]
+    n_ch = int(params["norm_mu"].shape[0])
     X = seq_features(
         f,
         blocks,
@@ -273,8 +454,20 @@ def emissions_from_weights(f, blocks, pitch, ball_evidence, weights):
         ball_evidence,
         dead_variant=weights.get("dead_variant", "stat"),
         team_variant=weights.get("team_variant", "duel_past"),
+        include_kinematic=(n_ch == 78),
     )
     out = predict_game_numpy(X, blocks, params)
+    if weights.get("tta_swap", True):
+        anti = antisym_mask(n_ch)
+        X_swap = X.copy()
+        X_swap[:, anti] = -X_swap[:, anti]
+        out_swap = predict_game_numpy(X_swap, blocks, params)
+        out = {
+            "s_team_raw": 0.5 * (out["s_team_raw"] - out_swap["s_team_raw"]),
+            "s_dead_raw": 0.5 * (out["s_dead_raw"] + out_swap["s_dead_raw"]),
+            "p_change": 0.5 * (out["p_change"] + out_swap["p_change"]),
+            "p_dead_edge": 0.5 * (out["p_dead_edge"] + out_swap["p_dead_edge"]),
+        }
     s_team = (out["s_team_raw"] * float(weights.get("t_team", 1.0))).astype(np.float32)
     s_dead = (out["s_dead_raw"] * float(weights.get("t_dead", 1.0))).astype(np.float32)
     return s_team, s_dead, out["p_change"]
