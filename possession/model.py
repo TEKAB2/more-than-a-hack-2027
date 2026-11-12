@@ -301,6 +301,10 @@ def load_weights(path=WEIGHTS):
         with open(os.path.join(os.path.dirname(path), w["model_file"])) as handle:
             models = json.load(handle)
         w["dead"], w["team"] = models["dead"], models["team"]
+    elif w.get("kind") == "seq":
+        from possession import seqmodel
+        npz_path = os.path.join(os.path.dirname(path), w["model_file"])
+        w["seq_params"] = seqmodel.load_seq_params(npz_path)
     return w
 
 

@@ -101,13 +101,14 @@ def switch_schedule(n, costs=None, p_change=None, s_team=None):
     return sw_active, sw_active
 
 
-def viterbi(log_em, costs=None, p_change=None, s_team=None):
+def viterbi(log_em, costs=None, change_bonus=None, p_change=None, s_team=None):
     c = dict(COSTS, **(costs or {}))
     n = len(log_em)
     back = np.zeros((n, 3), dtype=np.int8)
     score = log_em[0].astype(np.float64).copy()
 
-    if p_change is None or float(c.get("change_alpha", 0.0)) == 0.0:
+    use_schedule = (p_change is not None) and (float(c.get("change_alpha", 0.0)) > 0.0)
+    if not use_schedule and change_bonus is None:
         trans = np.array([
             [0.0, -c["switch"], -c["to_dead"]],
             [-c["switch"], 0.0, -c["to_dead"]],
@@ -118,13 +119,35 @@ def viterbi(log_em, costs=None, p_change=None, s_team=None):
             best = cand.argmax(axis=0)
             back[t] = best
             score = cand[best, np.arange(3)] + log_em[t]
-    else:
+    elif use_schedule:
         sw_h2a, sw_a2h = switch_schedule(n, c, p_change=p_change, s_team=s_team)
+        if change_bonus is not None:
+            bonus = np.asarray(change_bonus, dtype=np.float64)
+            sw_h2a = np.maximum(0.0, sw_h2a - bonus)
+            sw_a2h = np.maximum(0.0, sw_a2h - bonus)
         to_dead = float(c["to_dead"])
         restart = float(c["restart"])
         trans_all = np.zeros((n, 3, 3), dtype=np.float64)
         trans_all[:, 0, 1] = -sw_h2a
         trans_all[:, 1, 0] = -sw_a2h
+        trans_all[:, 0, 2] = -to_dead
+        trans_all[:, 1, 2] = -to_dead
+        trans_all[:, 2, 0] = -restart
+        trans_all[:, 2, 1] = -restart
+        idx3 = np.arange(3)
+        for t in range(1, n):
+            cand = score[:, None] + trans_all[t]
+            best = cand.argmax(axis=0)
+            back[t] = best
+            score = cand[best, idx3] + log_em[t]
+    else:
+        bonus = np.asarray(change_bonus, dtype=np.float64)
+        to_dead = float(c["to_dead"])
+        restart = float(c["restart"])
+        sw = np.maximum(0.0, float(c["switch"]) - bonus)
+        trans_all = np.zeros((n, 3, 3), dtype=np.float64)
+        trans_all[:, 0, 1] = -sw
+        trans_all[:, 1, 0] = -sw
         trans_all[:, 0, 2] = -to_dead
         trans_all[:, 1, 2] = -to_dead
         trans_all[:, 2, 0] = -restart
@@ -143,14 +166,21 @@ def viterbi(log_em, costs=None, p_change=None, s_team=None):
     return path
 
 
-def decode(s_team, s_dead, blocks, n_frames, costs=None, p_change=None):
+def decode(s_team, s_dead, blocks, n_frames, costs=None, change_bonus=None, p_change=None):
     """Label array (n_frames,) of 'H'/'A'/'D', 'X' outside the graded half blocks."""
     labels = np.full(n_frames, "X", dtype="<U1")
     st64 = s_team.astype(np.float64)
     log_em = log_emissions(st64, s_dead.astype(np.float64))
     for _, first, last in blocks:
-        pc_sl = p_change[first:last + 1] if p_change is not None else None
-        path = viterbi(log_em[first:last + 1], costs, p_change=pc_sl, s_team=st64[first:last + 1])
+        cb = None if change_bonus is None else change_bonus[first:last + 1]
+        pc = None if p_change is None else p_change[first:last + 1]
+        path = viterbi(
+            log_em[first:last + 1],
+            costs,
+            change_bonus=cb,
+            p_change=pc,
+            s_team=st64[first:last + 1],
+        )
         labels[first:last + 1] = LETTERS[path]
     return labels
 
