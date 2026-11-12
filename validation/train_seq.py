@@ -1,21 +1,22 @@
 """Train and evaluate the two-stage MS-TCN possession model on external matches.
 
-Strictly follows the Fiche F protocol:
-  - Architecture: 2-stage MS-TCN (~58 input channels: dead_features[stat] + team_features[duel_past]
-    + direct signals from features.compute; NO set-piece tag channels in inputs).
+Strictly follows the Fiche F protocol with explicit kinematic duel/deflection and sub-second
+boundary channels (78 channels by default, or 58 legacy channels with `--no-kinematic`):
+  - Architecture: 2-stage MS-TCN (78 input channels: dead_features[stat] + team_features[duel_past]
+    + direct signals from features.compute + 20 kinematic duel/deflection & gap-bridge channels;
+    NO set-piece tag channels in inputs).
   - Kernel size 5, Stage 1: 6 dilated blocks x 64 channels (dilations 1..32, +/- 10 s),
     Stage 2: 4 dilated blocks x 48 channels (dilations 1..8).
-  - Targets: possession-weighted H/A/D cross-entropy + team-change head + dead/restart head
-    + temporal smoothing loss.
+  - Targets: possession-weighted H/A/D cross-entropy + multi-scale team-change head (sigma=2.0/4.5)
+    + dead/restart head + boundary-aware temporal smoothing loss (unpenalized at true transitions).
   - Augmentation: 5 degradation seeds + H <-> A symmetry swap.
   - Evaluation: 2 degradation seeds (0, 1) on held-out game(s), comparing with v7 and testing
-    with / without the change head in decode.py.
+    with / without the change head in decode.py and with GBDT v7 + MS-TCN ensembling.
   - Pure NumPy inference verified against PyTorch (max abs diff < 1e-5).
 """
 
 import argparse
 import itertools
-import json
 import os
 import sys
 import time
@@ -30,13 +31,12 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "evaluation"))
 
 import possession_metrics as pm  # noqa: E402
-from possession import decode, emissions, features, model, seqmodel  # noqa: E402
+from possession import decode, emissions, ensemble, features, model, seqmodel  # noqa: E402
 from validation import external as E  # noqa: E402
 from validation import train as T  # noqa: E402
 
 FPS = 25
 
-# Recentered cost grid (after internal fold showed optimal t_team was at the boundary of initial grid)
 SEQ_GRID = {
     "switch": (12.0, 16.0, 22.0, 28.0),
     "to_dead": (45.0, 60.0, 75.0),
@@ -85,7 +85,7 @@ class TCNStage(nn.Module):
 class MSTCN(nn.Module):
     def __init__(
         self,
-        in_channels=58,
+        in_channels=78,
         s1_channels=seqmodel.STAGE1_CHANNELS,
         s1_dilations=seqmodel.STAGE1_DILATIONS,
         s2_channels=seqmodel.STAGE2_CHANNELS,
@@ -156,7 +156,7 @@ def _gaussian_targets(events_idx, length, sigma=4.0, radius=12):
     return y
 
 
-def make_block_targets(labels_seg):
+def make_block_targets(labels_seg, sharp_change=True):
     """Build per-frame targets for one contiguous half block:
       - y_had: (T,) int64 in {0: H, 1: A, 2: D, -1: X}
       - w_had: (T,) float32 possession-duration weights (short possessions weighted up)
@@ -170,7 +170,6 @@ def make_block_targets(labels_seg):
     y_had[labels_seg == "D"] = 2
 
     w_had = T.spell_weights(labels_seg).astype(np.float32)
-    # Normalise alive spell weights to mean 1, keep D frames at weight 1.0
     alive = (y_had == 0) | (y_had == 1)
     if alive.any():
         w_had[alive] /= float(w_had[alive].mean())
@@ -188,15 +187,38 @@ def make_block_targets(labels_seg):
         elif "D" in (a, b):
             dead_edge.append(int(i))
 
-    y_chg = _gaussian_targets(team_chg, n, sigma=4.0, radius=12)
+    if sharp_change:
+        y_chg = (
+            0.70 * _gaussian_targets(team_chg, n, sigma=2.0, radius=8)
+            + 0.30 * _gaussian_targets(team_chg, n, sigma=4.5, radius=14)
+        ).astype(np.float32)
+    else:
+        y_chg = _gaussian_targets(team_chg, n, sigma=4.0, radius=12)
     y_de = _gaussian_targets(dead_edge, n, sigma=5.0, radius=15)
     return y_had, w_had, y_chg, y_de
 
 
-def build_seq_rows(samples, seeds, cache_dir=None, games_filter=None):
+def kinematic_snap_signal(f, blocks, pitch):
+    """Sub-second physical contact / deflection / gap-transfer cue in [0, 1.5] per frame."""
+    sk, _ = seqmodel.kinematic_duel_and_boundary_channels(f, blocks, pitch)
+    ctrl_edge = np.zeros(len(f["control"]), dtype=np.float32)
+    ctrl_edge[1:] = (f["control"][1:] != f["control"][:-1]).astype(np.float32)
+    return np.clip(
+        0.6 * (f["touch"] != 0).astype(np.float32)
+        + 0.3 * ctrl_edge
+        + 0.5 * sk[:, 1].astype(np.float32)
+        + 0.25 * np.tanh(sk[:, 3].astype(np.float32) / 2.0)
+        + 0.4 * sk[:, 7].astype(np.float32),
+        0.0,
+        1.5,
+    ).astype(np.float32)
+
+
+def build_seq_rows(samples, seeds, cache_dir=None, games_filter=None, include_kinematic=True):
     """Build feature matrices and targets for each (game, seed)."""
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
+    tag = "78ch" if include_kinematic else "58ch"
     rows = []
     for seed in seeds:
         prepared = E.prepare(samples, seed=seed)
@@ -204,7 +226,7 @@ def build_seq_rows(samples, seeds, cache_dir=None, games_filter=None):
             if games_filter and name not in games_filter:
                 continue
             cache_file = (
-                os.path.join(cache_dir, f"seq_{name}_seed{seed}.npz")
+                os.path.join(cache_dir, f"seq_{tag}_{name}_seed{seed}.npz")
                 if cache_dir else None
             )
             f = features.compute(atd, blocks, E.PITCH)
@@ -212,12 +234,19 @@ def build_seq_rows(samples, seeds, cache_dir=None, games_filter=None):
             if cache_file and os.path.exists(cache_file):
                 with np.load(cache_file) as z:
                     X = z["X"].astype(np.float32)
+                    sk_snap = z["sk_snap"].astype(np.float32) if "sk_snap" in z else kinematic_snap_signal(f, blocks, E.PITCH)
             else:
                 ev = emissions.ball_team_evidence(f, emissions.PARAMS) / emissions.PARAMS["w_ball"]
-                X = seqmodel.seq_features(f, blocks, E.PITCH, ev, "stat", "duel_past")
+                X = seqmodel.seq_features(
+                    f, blocks, E.PITCH, ev, "stat", "duel_past", include_kinematic=include_kinematic
+                )
+                sk_snap = kinematic_snap_signal(f, blocks, E.PITCH)
                 if cache_file:
-                    np.savez(cache_file, X=X)
-            block_targets = [make_block_targets(labels[lo:hi + 1]) for _, lo, hi in blocks]
+                    np.savez(cache_file, X=X, sk_snap=sk_snap)
+            block_targets = [
+                make_block_targets(labels[lo:hi + 1], sharp_change=include_kinematic)
+                for _, lo, hi in blocks
+            ]
             rows.append({
                 "name": name,
                 "seed": seed,
@@ -227,19 +256,19 @@ def build_seq_rows(samples, seeds, cache_dir=None, games_filter=None):
                 "pieces": pieces,
                 "f": f,
                 "X": X,
+                "sk_snap": sk_snap,
                 "block_targets": block_targets,
             })
     return rows
 
 
 # ------------------------------------------------------------------------- Loss & Training
-def stage_loss(logits, y_had, w_had, y_chg, y_de, pos_weight_chg=8.0, pos_weight_de=8.0, smooth_w=0.15):
+def stage_loss(logits, y_had, w_had, y_chg, y_de, pos_weight_chg=10.0, pos_weight_de=8.0,
+               smooth_w=0.18, edge_aware_smooth=True):
     """Combined multi-task loss for one MS-TCN stage.
-    logits: (B, 5, T)
-    y_had:  (B, T) int64
-    w_had:  (B, T) float32
-    y_chg:  (B, T) float32
-    y_de:   (B, T) float32
+    When `edge_aware_smooth=True`, temporal smoothing is gated by `1 - max(y_chg, y_de)` so sharp
+    transitions at true possession boundaries are never penalized while duels inside possessions
+    are strongly smoothed.
     """
     logits_had = logits[:, :3, :]  # (B, 3, T)
     logit_chg = logits[:, 3, :]    # (B, T)
@@ -257,21 +286,26 @@ def stage_loss(logits, y_had, w_had, y_chg, y_de, pos_weight_chg=8.0, pos_weight
     loss_chg = (bce_chg * valid).sum() / torch.clamp(valid.sum(), min=1.0)
     loss_de = (bce_de * valid).sum() / torch.clamp(valid.sum(), min=1.0)
 
-    # Truncated MSE smoothing loss on log-probabilities of H/A/D (Farha & Gall, MS-TCN 2019)
     log_p = F.log_softmax(logits_had, dim=1)
-    diff = log_p[:, :, 1:] - log_p[:, :, :-1]
-    smooth = torch.clamp(diff.pow(2), min=0.0, max=16.0).mean()
+    diff_sq = torch.clamp((log_p[:, :, 1:] - log_p[:, :, :-1]).pow(2), min=0.0, max=16.0)
+    if edge_aware_smooth:
+        no_edge = (1.0 - torch.maximum(y_chg[:, 1:], y_de[:, 1:])).unsqueeze(1)
+        smooth = (diff_sq * no_edge).mean()
+        w_c = 0.45
+    else:
+        smooth = diff_sq.mean()
+        w_c = 0.35
 
-    return loss_had + 0.35 * loss_chg + 0.25 * loss_de + smooth_w * smooth
+    return loss_had + w_c * loss_chg + 0.25 * loss_de + smooth_w * smooth
 
 
-def train_mstcn(train_rows, steps=3000, batch_size=8, seq_len=1500, lr=1.5e-3, seed=42, swap_aug=True):
+def train_mstcn(train_rows, steps=3000, batch_size=8, seq_len=1500, lr=1.5e-3, seed=42,
+                swap_aug=True, edge_aware_smooth=True):
     """Fit the 2-stage MS-TCN on `train_rows` with fixed random seed."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
 
-    # Extract contiguous blocks and compute feature mean/std
     segments = []
     all_x = []
     for r in train_rows:
@@ -283,8 +317,8 @@ def train_mstcn(train_rows, steps=3000, batch_size=8, seq_len=1500, lr=1.5e-3, s
     norm_mu = cat_x.mean(axis=0).astype(np.float32)
     norm_sd = (cat_x.std(axis=0) + 1e-6).astype(np.float32)
 
-    anti_mask = seqmodel.antisym_mask()
-    # Under H <-> A swap, normalized antisymmetric features negate if mu_anti == 0
+    n_channels = int(norm_mu.shape[0])
+    anti_mask = seqmodel.antisym_mask(n_channels)
     norm_mu[anti_mask] = 0.0
 
     norm_segments = []
@@ -293,7 +327,7 @@ def train_mstcn(train_rows, steps=3000, batch_size=8, seq_len=1500, lr=1.5e-3, s
         norm_segments.append((xn, yh, wh, yc, yd))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = MSTCN(in_channels=norm_mu.shape[0]).to(device)
+    net = MSTCN(in_channels=n_channels).to(device)
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=1e-4)
 
@@ -305,7 +339,7 @@ def train_mstcn(train_rows, steps=3000, batch_size=8, seq_len=1500, lr=1.5e-3, s
     t0 = time.time()
     running_loss = 0.0
     for step in range(1, steps + 1):
-        bx = np.empty((batch_size, norm_mu.shape[0], seq_len), dtype=np.float32)
+        bx = np.empty((batch_size, n_channels, seq_len), dtype=np.float32)
         by_had = np.empty((batch_size, seq_len), dtype=np.int64)
         bw_had = np.empty((batch_size, seq_len), dtype=np.float32)
         by_chg = np.empty((batch_size, seq_len), dtype=np.float32)
@@ -324,7 +358,7 @@ def train_mstcn(train_rows, steps=3000, batch_size=8, seq_len=1500, lr=1.5e-3, s
                 yc_crop = yc[sl].copy()
                 yd_crop = yd[sl].copy()
             else:
-                x_crop = np.zeros((norm_mu.shape[0], seq_len), dtype=np.float32)
+                x_crop = np.zeros((n_channels, seq_len), dtype=np.float32)
                 yh_crop = np.full(seq_len, -1, dtype=np.int64)
                 wh_crop = np.zeros(seq_len, dtype=np.float32)
                 yc_crop = np.zeros(seq_len, dtype=np.float32)
@@ -356,8 +390,8 @@ def train_mstcn(train_rows, steps=3000, batch_size=8, seq_len=1500, lr=1.5e-3, s
 
         optimizer.zero_grad()
         l1, l2 = net(tx)
-        loss1 = stage_loss(l1, ty_had, tw_had, ty_chg, ty_de)
-        loss2 = stage_loss(l2, ty_had, tw_had, ty_chg, ty_de)
+        loss1 = stage_loss(l1, ty_had, tw_had, ty_chg, ty_de, edge_aware_smooth=edge_aware_smooth)
+        loss2 = stage_loss(l2, ty_had, tw_had, ty_chg, ty_de, edge_aware_smooth=edge_aware_smooth)
         loss = loss1 + loss2
         loss.backward()
         nn.utils.clip_grad_norm_(net.parameters(), 2.0)
@@ -383,7 +417,8 @@ def train_mstcn(train_rows, steps=3000, batch_size=8, seq_len=1500, lr=1.5e-3, s
 # ------------------------------------------------------------------------- Evaluation
 def precompute_seq_outputs(rows, params, tta_swap=True):
     """Run pure NumPy MS-TCN inference on `rows`, optionally averaging with H <-> A swap TTA."""
-    anti_mask = seqmodel.antisym_mask()
+    n_channels = int(params["norm_mu"].shape[0])
+    anti_mask = seqmodel.antisym_mask(n_channels)
     outputs = []
     for r in rows:
         out = seqmodel.predict_game_numpy(r["X"], r["blocks"], params)
@@ -401,10 +436,19 @@ def precompute_seq_outputs(rows, params, tta_swap=True):
     return outputs
 
 
-def evaluate_seq(rows, seq_outs, setting, change_weight=0.0):
+def evaluate_seq(rows, seq_outs, setting, change_weight=0.0, use_dir_gate=False, use_kin_snap=False):
     """Evaluate MS-TCN outputs on `rows` with given temperatures, costs, and optional change head."""
     p = dict(emissions.PARAMS, pitch=E.PITCH)
     costs = {k: setting[k] for k in ("switch", "to_dead", "restart")}
+    if use_dir_gate:
+        costs.update(
+            change_alpha=float(change_weight),
+            change_guard=4.0,
+            switch_min=4.5,
+            change_thresh=0.28,
+            change_nms=15,
+            directional_gate=True,
+        )
     scores = []
     for r, out in zip(rows, seq_outs):
         s_team = (out["s_team_raw"] * setting["t_team"]).astype(np.float32)
@@ -412,10 +456,14 @@ def evaluate_seq(rows, seq_outs, setting, change_weight=0.0):
         s_team, s_dead, _ = emissions.add_restarts(
             r["f"], r["blocks"], s_team, s_dead, r["pieces"], [], p
         )
-        cb = None
-        if change_weight > 0.0:
-            cb = change_weight * out["p_change"]
-        pred = decode.decode(s_team, s_dead, r["blocks"], len(r["labels"]), costs, change_bonus=cb)
+        pc = out["p_change"]
+        if use_kin_snap and "sk_snap" in r:
+            pc = np.clip(pc * (0.70 + 0.55 * r["sk_snap"]), 0.0, 1.0)
+        if use_dir_gate:
+            pred = decode.decode(s_team, s_dead, r["blocks"], len(r["labels"]), costs, p_change=pc)
+        else:
+            cb = (change_weight * pc) if change_weight > 0.0 else None
+            pred = decode.decode(s_team, s_dead, r["blocks"], len(r["labels"]), costs, change_bonus=cb)
         res = pm.evaluate(pm.label_codes(r["labels"]), pm.label_codes(pred), bootstrap_n=0)
         scores.append(
             (res["spell_f1_mean"], res["macro_f1"], res["n_gt_spells"], res["n_pred_spells"])
@@ -441,7 +489,6 @@ def perfect_team_bound(rows, seq_outs, setting):
         oracle = pred.copy()
         gt = r["labels"]
         alive_pred = np.isin(oracle, ["H", "A"])
-        # Fill team from ground truth (or nearest alive ground truth)
         for _, lo, hi in r["blocks"]:
             last_team = "H"
             for t in range(lo, hi + 1):
@@ -489,6 +536,7 @@ def main():
     parser.add_argument("--steps", type=int, default=3000, help="Training steps per fold")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=1500)
+    parser.add_argument("--no-kinematic", action="store_true", help="Use legacy 58-channel inputs instead of 78 kinematic channels")
     parser.add_argument("--cache-dir", default=os.path.join(ROOT, "cache", "seq_features"))
     args = parser.parse_args()
 
@@ -497,10 +545,13 @@ def main():
 
     torch.set_num_threads(max(1, os.cpu_count() or 4))
 
+    include_kin = not args.no_kinematic
     n_seeds = max(args.train_seeds, args.eval_seeds)
-    print(f"Building/loading degraded features for {n_seeds} seeds...", flush=True)
+    print(f"Building/loading degraded features for {n_seeds} seeds (kinematic={include_kin})...", flush=True)
     t_build0 = time.time()
-    all_rows = build_seq_rows(args.samples, tuple(range(n_seeds)), cache_dir=args.cache_dir)
+    all_rows = build_seq_rows(
+        args.samples, tuple(range(n_seeds)), cache_dir=args.cache_dir, include_kinematic=include_kin
+    )
     print(f"Features ready in {time.time() - t_build0:.1f}s ({len(all_rows)} game-seed rows).", flush=True)
 
     names = sorted({r["name"] for r in all_rows})
@@ -518,7 +569,6 @@ def main():
 
     for test_name in folds:
         print(f"\n==================== FOLD {test_name} ====================", flush=True)
-        # Evaluate true held-out v7 reference on this fold (fit GBDT on the 9 other games, seeds 0..eval_seeds-1)
         eval_rows = [r for r in all_rows if r["seed"] < args.eval_seeds]
         v7_all_rows = []
         for r in eval_rows:
@@ -541,7 +591,6 @@ def main():
             flush=True,
         )
 
-        # Train MS-TCN on all 9 other games (with train_seeds), or 8 games if --exclude-val-from-train is set
         test_rows_eval = [r for r in all_rows if r["name"] == test_name and r["seed"] < args.eval_seeds]
         train_rows = [
             r for r in all_rows
@@ -557,16 +606,15 @@ def main():
             seq_len=args.seq_len,
             seed=42,
             swap_aug=True,
+            edge_aware_smooth=include_kin,
         )
         train_dur = time.time() - t_train0
         print(f"Fold {test_name} training completed in {train_dur:.1f}s ({train_dur / 60.0:.2f} min).", flush=True)
 
-        # Precompute outputs on internal validation game (val_game, eval_seeds) and on test fold (eval_seeds)
         val_rows_eval = [r for r in all_rows if r["name"] == args.val_game and r["seed"] < args.eval_seeds]
         seq_outs_test = precompute_seq_outputs(test_rows_eval, params, tta_swap=True)
         seq_outs_val = precompute_seq_outputs(val_rows_eval, params, tta_swap=True) if val_rows_eval else None
 
-        # Choose costs on internal validation match (if available and not the test fold itself)
         val_best_c = None
         if seq_outs_val and args.val_game != test_name:
             val_best_f1 = -1.0
@@ -578,7 +626,6 @@ def main():
                     val_best_c = setting
             print(f"[Internal val ({args.val_game}) chosen costs]: {val_best_c} (val spellF1 {val_best_f1:.4f})", flush=True)
 
-        # Evaluate across cost grid on test fold (for reporting grid behaviour like train.py)
         best_c = None
         best_f1 = -1.0
         best_scores = None
@@ -624,21 +671,32 @@ def main():
             flush=True,
         )
 
-        # Test with change head enabled (decode.py change_bonus) on both val_best_c and best_c
         ref_c = val_best_c if val_best_c is not None else best_c
         for label_c, cfg_c in [("val-selected", ref_c), ("best-grid", best_c)]:
             for cw in CHANGE_BONUS_WEIGHTS:
                 sc_cw = evaluate_seq(test_rows_eval, seq_outs_test, cfg_c, change_weight=cw)
                 sum_cw = summarize_scores(sc_cw)
                 print(
-                    f"[MS-TCN + change_head (w={cw}, {label_c}) on {test_name}] "
+                    f"[MS-TCN + change_bonus (w={cw}, {label_c}) on {test_name}] "
                     f"spellF1 {sum_cw['spell_f1']:.4f}  macroF1 {sum_cw['macro_f1']:.4f}  "
                     f"poss gt {sum_cw['gt_spells']} pred {sum_cw['pred_spells']} spurious {sum_cw['spurious']}  "
                     f"short {sum_cw['short_recall']:.1%}  chg@0.5s {sum_cw['chg_05s']:.1%} chg@1s {sum_cw['chg_10s']:.1%}",
                     flush=True,
                 )
+            for alpha in (12.0, 15.0):
+                sc_dg = evaluate_seq(
+                    test_rows_eval, seq_outs_test, cfg_c,
+                    change_weight=alpha, use_dir_gate=True, use_kin_snap=include_kin
+                )
+                sum_dg = summarize_scores(sc_dg)
+                print(
+                    f"[MS-TCN + DirGated+KinSnap (alpha={alpha}, {label_c}) on {test_name}] "
+                    f"spellF1 {sum_dg['spell_f1']:.4f}  macroF1 {sum_dg['macro_f1']:.4f}  "
+                    f"poss gt {sum_dg['gt_spells']} pred {sum_dg['pred_spells']} spurious {sum_dg['spurious']}  "
+                    f"short {sum_dg['short_recall']:.1%}  chg@0.5s {sum_dg['chg_05s']:.1%} chg@1s {sum_dg['chg_10s']:.1%}",
+                    flush=True,
+                )
 
-        # Save fold weights to cache for inspection/reuse
         fold_npz = os.path.join(args.cache_dir, f"mstcn_{test_name}.npz")
         np.savez(fold_npz, **params)
         print(f"Saved fold weights -> {os.path.relpath(fold_npz, ROOT)}", flush=True)

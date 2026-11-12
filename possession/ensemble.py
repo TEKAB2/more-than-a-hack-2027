@@ -33,11 +33,15 @@ DEFAULT_ENSEMBLE = {
     "t_dead": 1.0,
     "b_team": 0.0,
     "b_dead": 0.0,
-    # Change-head pooling (across MS-TCN seeds and optional kinematic change proxy)
+    #Change-head pooling (across MS-TCN seeds and optional kinematic change proxy)
     "change_temp": 1.0,
     "change_bias": 0.0,
     "change_power": 1.5,       # power-mean exponent > 1 preserves sharp peaks across seeds
     "w_kinematic_change": 0.0, # optional weight for kinematic turnover cue when seq p_change is absent/blended
+    # Optional frequency-separated fusion: near boundaries (|s_seq| < boundary_band or p_change high),
+    # suppress causal tree logits so they cannot lag or shift the MS-TCN zero-crossing!
+    "boundary_gate_trees": True,
+    "boundary_band": 1.5,
 }
 
 
@@ -206,7 +210,16 @@ def combine_emissions(tree_out=None, seq_out=None, f=None, blocks=(), cfg=None):
         wt = float(c["w_tree_team"])
         ws = float(c["w_seq_team"])
         norm_t = max(wt + ws, 1e-9)
-        s_team = (wt * t_st + ws * s_st) / norm_t
+        wt_rel = wt / norm_t
+        if c.get("boundary_gate_trees", True):
+            band = max(float(c.get("boundary_band", 1.5)), 0.1)
+            far = np.clip((np.abs(s_st) - 0.8) / band, 0.0, 1.0)
+            if s_pc is not None:
+                far = far * np.clip((0.25 - s_pc) / 0.25, 0.0, 1.0)
+            w_t_frame = wt_rel * far
+            s_team = (1.0 - w_t_frame) * s_st + w_t_frame * t_st
+        else:
+            s_team = (wt * t_st + ws * s_st) / norm_t
 
         wd_t = float(c["w_tree_dead"])
         wd_s = float(c["w_seq_dead"])
