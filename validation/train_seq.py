@@ -460,13 +460,23 @@ def stage_loss(logits, y_had, w_had, y_chg, y_de, y_off=None, m_off=None,
 
 
 def train_mstcn(train_rows, steps=3000, batch_size=4, seq_len=1200, lr=1.5e-3, seed=42,
-                swap_aug=True, edge_aware_smooth=True, use_segment_iou=False):
-    """Fit the 2-stage MS-TCN on `train_rows` with fixed random seed."""
+                swap_aug=True, edge_aware_smooth=True, use_segment_iou=False,
+                init_params=None, pff_sample_ratio=None, ema_decay=0.995):
+    """Fit the 2-stage MS-TCN on `train_rows` with fixed random seed.
+
+    Supports:
+      - `init_params`: dict from a universal PFF pre-trained checkpoint (locks `norm_mu`/`norm_sd`
+        and initializes network weights for domain-adapted fine-tuning).
+      - `pff_sample_ratio`: if set (e.g. 0.30), balances batch sampling so `(1 - pff_sample_ratio)`
+        of crops come from bench games and `pff_sample_ratio` come from PFF FC games.
+      - `ema_decay`: Exponential Moving Average over model weights during the second half of training.
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
 
     segments = []
+    is_pff_seg = []
     all_x = []
     for r in train_rows:
         for (_, lo, hi), bt in zip(r["blocks"], r["block_targets"]):
@@ -474,10 +484,17 @@ def train_mstcn(train_rows, steps=3000, batch_size=4, seq_len=1200, lr=1.5e-3, s
             yo = bt[4] if len(bt) >= 6 else np.zeros(len(x_seg), dtype=np.float32)
             mo = bt[5] if len(bt) >= 6 else np.zeros(len(x_seg), dtype=np.float32)
             segments.append((x_seg, bt[0], bt[1], bt[2], bt[3], yo, mo))
-            all_x.append(x_seg[::10])
-    cat_x = np.vstack(all_x).astype(np.float64)
-    norm_mu = cat_x.mean(axis=0).astype(np.float32)
-    norm_sd = (cat_x.std(axis=0) + 1e-6).astype(np.float32)
+            is_pff_seg.append(bool(r.get("is_pff", False)))
+            if init_params is None:
+                all_x.append(x_seg[::10])
+
+    if init_params is not None:
+        norm_mu = np.asarray(init_params["norm_mu"], dtype=np.float32).copy()
+        norm_sd = np.asarray(init_params["norm_sd"], dtype=np.float32).copy()
+    else:
+        cat_x = np.vstack(all_x).astype(np.float64)
+        norm_mu = cat_x.mean(axis=0).astype(np.float32)
+        norm_sd = (cat_x.std(axis=0) + 1e-6).astype(np.float32)
 
     n_channels = int(norm_mu.shape[0])
     anti_mask = seqmodel.antisym_mask(n_channels)
@@ -491,12 +508,32 @@ def train_mstcn(train_rows, steps=3000, batch_size=4, seq_len=1200, lr=1.5e-3, s
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_heads = 6 if use_segment_iou else 5
     net = MSTCN(in_channels=n_channels, out_heads=out_heads).to(device)
+    if init_params is not None:
+        sd_load = {}
+        for k, v in net.state_dict().items():
+            if k in init_params and init_params[k].shape == tuple(v.shape):
+                sd_load[k] = torch.from_numpy(np.asarray(init_params[k], dtype=np.float32))
+            else:
+                sd_load[k] = v
+        net.load_state_dict(sd_load)
+
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=lr * 0.05)
 
     anti_idx = np.flatnonzero(anti_mask)
-    seg_weights = np.array([len(s[0]) for s in norm_segments], dtype=np.float64)
-    seg_weights /= seg_weights.sum()
+    seg_lengths = np.array([len(s[0]) for s in norm_segments], dtype=np.float64)
+    is_pff_arr = np.array(is_pff_seg, dtype=bool)
+    if pff_sample_ratio is not None and is_pff_arr.any() and (~is_pff_arr).any():
+        w_bench = np.where(~is_pff_arr, seg_lengths, 0.0)
+        w_pff = np.where(is_pff_arr, seg_lengths, 0.0)
+        w_bench /= w_bench.sum()
+        w_pff /= w_pff.sum()
+        seg_weights = (1.0 - float(pff_sample_ratio)) * w_bench + float(pff_sample_ratio) * w_pff
+    else:
+        seg_weights = seg_lengths / seg_lengths.sum()
+
+    ema_state = None
+    ema_start = max(1, int(steps * 0.5))
 
     net.train()
     t0 = time.time()
@@ -579,6 +616,14 @@ def train_mstcn(train_rows, steps=3000, batch_size=4, seq_len=1200, lr=1.5e-3, s
         optimizer.step()
         scheduler.step()
 
+        if ema_decay and ema_decay > 0.0 and step >= ema_start:
+            with torch.no_grad():
+                if ema_state is None:
+                    ema_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+                else:
+                    for k, v in net.state_dict().items():
+                        ema_state[k].mul_(ema_decay).add_(v.detach(), alpha=1.0 - ema_decay)
+
         running_loss += float(loss.item())
         if step % 500 == 0 or step == steps:
             elapsed = time.time() - t0
@@ -588,6 +633,9 @@ def train_mstcn(train_rows, steps=3000, batch_size=4, seq_len=1200, lr=1.5e-3, s
                 flush=True,
             )
             running_loss = 0.0
+
+    if ema_state is not None:
+        net.load_state_dict(ema_state)
 
     params = export_numpy_params(net, norm_mu, norm_sd)
     max_diff = verify_numpy_vs_torch(net.cpu(), params, segments[0][0][:2000])
@@ -769,7 +817,12 @@ def main():
     parser.add_argument("--seq-len", type=int, default=1200)
     parser.add_argument("--no-kinematic", action="store_true", help="Use legacy 58-channel inputs instead of kinematic channels")
     parser.add_argument("--no-carrier", action="store_true", help="Use 78-channel inputs without 22-player carrier/imputation channels")
+    parser.add_argument("--carrier", action="store_true", help="Explicitly enable 102-channel inputs (enabled by default unless --no-carrier)")
     parser.add_argument("--segment-iou", action="store_true", help="Train 6-head MS-TCN with Segment Soft-IoU, Anti-Fragmentation, and Boundary-Offset Regression")
+    parser.add_argument("--pretrain-steps", type=int, default=0, help="Phase 1 universal pre-training steps on all PFF FC matches (0 = disabled)")
+    parser.add_argument("--finetune-steps", type=int, default=1200, help="Phase 2 domain-adapted fine-tuning steps per fold & seed")
+    parser.add_argument("--model-seeds", type=int, default=1, help="Number of distinct MS-TCN training seeds per fold")
+    parser.add_argument("--pff-ratio", type=float, default=0.30, help="PFF sampling ratio during Phase 2 fine-tuning (default: 0.30)")
     parser.add_argument("--reuse-checkpoints", action="store_true", help="Reuse cached fold model checkpoints if present")
     parser.add_argument("--cache-dir", default=os.path.join(ROOT, "cache", "seq_features"))
     parser.add_argument("--save-oof", default=None, help="Save out-of-fold MS-TCN predictions to .npz")
@@ -782,7 +835,7 @@ def main():
     torch.set_num_threads(max(1, os.cpu_count() or 4))
 
     include_kin = not args.no_kinematic
-    include_car = include_kin and (not args.no_carrier)
+    include_car = include_kin and (args.carrier or not args.no_carrier)
     ch_tag = _channel_tag(include_kin, include_car)
     n_seeds = max(args.train_seeds, args.eval_seeds)
     print(
@@ -801,7 +854,7 @@ def main():
     print(f"Bench features ready in {time.time() - t_build0:.1f}s ({len(all_rows)} game-seed rows).", flush=True)
 
     pff_rows = []
-    if args.use_pff:
+    if args.use_pff or args.pretrain_steps > 0:
         t_pff0 = time.time()
         pff_rows = build_pff_rows(
             E.IDSSE_DIR,
@@ -848,7 +901,41 @@ def main():
     oof_seq_map = {}
     oof_tree_map = {}
     ch_tag = _channel_tag(include_kin, include_car)
-    pff_tag = "_pff" if args.use_pff else ""
+    pff_tag = f"_64pff_ms{args.model_seeds}" if args.pretrain_steps > 0 else ("_pff" if args.use_pff else "")
+
+    # Phase 1: Universal PFF FC Pre-training (100% disjoint from all 10 bench games)
+    pretrain_params = None
+    if args.pretrain_steps > 0 and pff_rows:
+        pretrain_npz = os.path.join(
+            args.cache_dir, f"mstcn_{ch_tag}_pretrain_pff{len({r['name'] for r in pff_rows})}_s{args.pretrain_steps}.npz"
+        )
+        if os.path.exists(pretrain_npz):
+            print(f"\n[Phase 1] Loading cached universal PFF pre-trained model -> {os.path.relpath(pretrain_npz, ROOT)}", flush=True)
+            pretrain_params = seqmodel.load_seq_params(pretrain_npz)
+        else:
+            print(
+                f"\n[Phase 1] Universal pre-training on {len(pff_rows)} PFF FC game-seeds for {args.pretrain_steps} steps...",
+                flush=True,
+            )
+            t_pre0 = time.time()
+            pretrain_params = train_mstcn(
+                pff_rows,
+                steps=args.pretrain_steps,
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                lr=1.5e-3,
+                seed=777,
+                swap_aug=True,
+                edge_aware_smooth=include_kin,
+                use_segment_iou=args.segment_iou,
+                ema_decay=0.995,
+            )
+            np.savez(pretrain_npz, **pretrain_params)
+            print(
+                f"[Phase 1] Universal PFF pre-training completed in {time.time() - t_pre0:.1f}s "
+                f"-> {os.path.relpath(pretrain_npz, ROOT)}",
+                flush=True,
+            )
 
     for fold_idx, test_names in enumerate(fold_groups, 1):
         fold_label = "+".join(test_names)
@@ -877,40 +964,80 @@ def main():
             flush=True,
         )
 
-        # 2. Train MS-TCN (or load cached checkpoint when --reuse-checkpoints is set)
-        fold_npz = os.path.join(args.cache_dir, f"mstcn_{ch_tag}{pff_tag}_{fold_label}.npz")
-        if args.reuse_checkpoints and os.path.exists(fold_npz):
-            params = seqmodel.load_seq_params(fold_npz)
-            print(f"Loaded cached fold checkpoint -> {os.path.relpath(fold_npz, ROOT)}", flush=True)
-        else:
-            train_rows = [
-                r for r in all_rows
-                if r["name"] not in test_set
-                and (not args.exclude_val_from_train or not args.val_game or args.val_game in test_set or r["name"] != args.val_game)
-                and r["seed"] < args.train_seeds
-            ] + pff_rows
+        # 2. Train MS-TCN (single seed or multi-seed Phase 2 fine-tuning from universal PFF checkpoint)
+        train_rows = [
+            r for r in all_rows
+            if r["name"] not in test_set
+            and (not args.exclude_val_from_train or not args.val_game or args.val_game in test_set or r["name"] != args.val_game)
+            and r["seed"] < args.train_seeds
+        ] + pff_rows
 
-            t_train0 = time.time()
-            params = train_mstcn(
-                train_rows,
-                steps=args.steps,
-                batch_size=args.batch_size,
-                seq_len=args.seq_len,
-                seed=42 + fold_idx,
-                swap_aug=True,
-                edge_aware_smooth=include_kin,
-                use_segment_iou=args.segment_iou,
+        n_m_seeds = max(1, int(args.model_seeds))
+        seed_outs_list = []
+        for ms_i in range(n_m_seeds):
+            fold_npz = os.path.join(
+                args.cache_dir,
+                f"mstcn_{ch_tag}{pff_tag}_{fold_label}_mseed{ms_i}.npz" if n_m_seeds > 1
+                else f"mstcn_{ch_tag}{pff_tag}_{fold_label}.npz",
             )
-            train_dur = time.time() - t_train0
-            np.savez(fold_npz, **params)
-            print(
-                f"Fold {fold_label} training ({len(train_rows)} game-seeds) completed in "
-                f"{train_dur:.1f}s ({train_dur / 60.0:.2f} min) -> {os.path.relpath(fold_npz, ROOT)}",
-                flush=True,
-            )
+            if args.reuse_checkpoints and os.path.exists(fold_npz):
+                params = seqmodel.load_seq_params(fold_npz)
+                print(f"Loaded cached fold checkpoint -> {os.path.relpath(fold_npz, ROOT)}", flush=True)
+            else:
+                t_train0 = time.time()
+                if pretrain_params is not None:
+                    params = train_mstcn(
+                        train_rows,
+                        steps=args.finetune_steps,
+                        batch_size=args.batch_size,
+                        seq_len=args.seq_len,
+                        lr=7e-4,
+                        seed=42 + fold_idx * 10 + ms_i,
+                        swap_aug=True,
+                        edge_aware_smooth=include_kin,
+                        use_segment_iou=args.segment_iou,
+                        init_params=pretrain_params,
+                        pff_sample_ratio=args.pff_ratio,
+                        ema_decay=0.995,
+                    )
+                else:
+                    params = train_mstcn(
+                        train_rows,
+                        steps=args.steps,
+                        batch_size=args.batch_size,
+                        seq_len=args.seq_len,
+                        lr=1.5e-3,
+                        seed=42 + fold_idx * 10 + ms_i,
+                        swap_aug=True,
+                        edge_aware_smooth=include_kin,
+                        use_segment_iou=args.segment_iou,
+                        pff_sample_ratio=(args.pff_ratio if pff_rows else None),
+                        ema_decay=0.995,
+                    )
+                train_dur = time.time() - t_train0
+                np.savez(fold_npz, **params)
+                print(
+                    f"Fold {fold_label} (seed {ms_i + 1}/{n_m_seeds}) training completed in "
+                    f"{train_dur:.1f}s ({train_dur / 60.0:.2f} min) -> {os.path.relpath(fold_npz, ROOT)}",
+                    flush=True,
+                )
+            seed_outs_list.append(precompute_seq_outputs(test_rows_eval, params, tta_swap=True))
 
-        # 3. Precompute MS-TCN outputs on test fold
-        seq_outs_test = precompute_seq_outputs(test_rows_eval, params, tta_swap=True)
+        # 3. Pool multi-seed MS-TCN outputs on test fold
+        seq_outs_test = []
+        for idx_r in range(len(test_rows_eval)):
+            st_pool = ensemble.pool_seed_logits([so[idx_r]["s_team_raw"] for so in seed_outs_list]).astype(np.float32)
+            sd_pool = ensemble.pool_seed_logits([so[idx_r]["s_dead_raw"] for so in seed_outs_list]).astype(np.float32)
+            pc_pool = ensemble.pool_change_probs([so[idx_r]["p_change"] for so in seed_outs_list], power=1.5).astype(np.float32)
+            pde_pool = np.mean([so[idx_r]["p_dead_edge"] for so in seed_outs_list], axis=0).astype(np.float32)
+            dt_pool = np.mean([so[idx_r]["delta_t"] for so in seed_outs_list], axis=0).astype(np.float32)
+            seq_outs_test.append({
+                "s_team_raw": st_pool,
+                "s_dead_raw": sd_pool,
+                "p_change": pc_pool,
+                "p_dead_edge": pde_pool,
+                "delta_t": dt_pool,
+            })
         for r_t, out_t in zip(test_rows_eval, seq_outs_test):
             oof_seq_map[(r_t["name"], r_t["seed"])] = out_t
 
@@ -1003,6 +1130,8 @@ def main():
                 save_dict[f"{prefix}_s_dead"] = out["s_dead_raw"]
                 save_dict[f"{prefix}_p_change"] = out["p_change"]
                 save_dict[f"{prefix}_p_dead_edge"] = out["p_dead_edge"]
+                if "delta_t" in out:
+                    save_dict[f"{prefix}_delta_t"] = out["delta_t"]
                 save_dict[f"{prefix}_tree_team"] = lt.astype(np.float32)
                 save_dict[f"{prefix}_tree_dead"] = ld.astype(np.float32)
             np.savez_compressed(args.save_oof, **save_dict)
