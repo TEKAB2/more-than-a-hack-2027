@@ -11,6 +11,9 @@ boundary channels (78 channels by default, or 58 legacy channels with `--no-kine
     + dead/restart head + boundary-aware temporal smoothing loss (unpenalized at true transitions).
   - Augmentation: 5 degradation seeds on bench games (+ degraded PFF FC World Cup 2022 games when
     `--use-pff` is enabled) + H <-> A symmetry swap.
+  - PFF is EXPERIMENTAL / out-of-submission until organisers authorise it. Writing weights with
+    PFF requires `--weights-tag` so submission `weights.json` / `weights_seq.npz` stay untouched
+    (see docs/PFF_VARIANT.md).
   - Evaluation: 2 degradation seeds (0, 1) on held-out bench folds, comparing:
       * GBDT v7 reference,
       * MS-TCN alone (without and with `DirGated + KinSnap` / `switch_schedule`),
@@ -827,11 +830,36 @@ def main():
     parser.add_argument("--reuse-checkpoints", action="store_true", help="Reuse cached fold model checkpoints if present")
     parser.add_argument("--cache-dir", default=os.path.join(ROOT, "cache", "seq_features"))
     parser.add_argument("--save-oof", default=None, help="Save out-of-fold MS-TCN predictions to .npz")
-    parser.add_argument("--write-weights", action="store_true", help="Fit final model on all games and write possession/weights*.json")
+    parser.add_argument(
+        "--write-weights",
+        action="store_true",
+        help="Fit final model on all training games and write possession weights "
+             "(requires --weights-tag when PFF is enabled so submission weights are never overwritten)",
+    )
+    parser.add_argument(
+        "--weights-tag",
+        default=None,
+        help="When writing weights, use possession/weights_<tag>.json and "
+             "possession/weights_seq_<tag>.npz instead of the submission defaults. "
+             "Required with --write-weights whenever --use-pff or --pretrain-steps > 0.",
+    )
     args = parser.parse_args()
 
     if not args.samples:
         parser.error("--samples is required (or set MTAH_SAMPLES)")
+    uses_pff = bool(args.use_pff or args.pretrain_steps > 0)
+    if args.write_weights and uses_pff and not args.weights_tag:
+        parser.error(
+            "--write-weights with PFF requires --weights-tag (e.g. --weights-tag pff) "
+            "so clean-ensemble submission weights are never overwritten"
+        )
+    if args.weights_tag is not None:
+        tag = str(args.weights_tag).strip()
+        if not tag or any(c in tag for c in "/\\") or tag in ("json", "npz"):
+            parser.error("--weights-tag must be a short non-empty name without path separators")
+        if tag in ("trees", "seq"):
+            parser.error("--weights-tag cannot be 'trees' or 'seq' (reserved submission names)")
+        args.weights_tag = tag
 
     torch.set_num_threads(max(1, os.cpu_count() or 4))
 
@@ -1192,7 +1220,20 @@ def main():
             )
 
         if args.write_weights:
-            print("\nFitting final full MS-TCN model on all bench + PFF games...", flush=True)
+            data_bits = [
+                "metrica-sports/sample-data games 1-3",
+                "IDSSE open Bundesliga matches (7 games)",
+            ]
+            if pff_rows:
+                data_bits.append(
+                    f"PFF FC FIFA World Cup 2022 ({len({r['name'] for r in pff_rows})} matches), degraded"
+                )
+            print(
+                f"\nFitting final full MS-TCN model on all training rows "
+                f"({len([r for r in all_rows if r['seed'] < args.train_seeds])} bench "
+                f"+ {len(pff_rows)} PFF)...",
+                flush=True,
+            )
             full_train_rows = [r for r in all_rows if r["seed"] < args.train_seeds] + pff_rows
             final_params = train_mstcn(
                 full_train_rows,
@@ -1204,14 +1245,31 @@ def main():
                 edge_aware_smooth=include_kin,
                 use_segment_iou=args.segment_iou,
             )
-            seq_npz_path = os.path.join(os.path.dirname(model.WEIGHTS), "weights_seq.npz")
+            weights_dir = os.path.dirname(model.WEIGHTS)
+            if args.weights_tag:
+                seq_name = f"weights_seq_{args.weights_tag}.npz"
+                json_name = f"weights_{args.weights_tag}.json"
+            else:
+                # Submission defaults — only reachable without PFF (guarded above).
+                seq_name = "weights_seq.npz"
+                json_name = os.path.basename(model.WEIGHTS)
+            seq_npz_path = os.path.join(weights_dir, seq_name)
+            json_path = os.path.join(weights_dir, json_name)
+            # Hard refuse overwriting the clean-ensemble submission pair when tagging.
+            if args.weights_tag and (
+                os.path.abspath(seq_npz_path) == os.path.abspath(os.path.join(weights_dir, "weights_seq.npz"))
+                or os.path.abspath(json_path) == os.path.abspath(model.WEIGHTS)
+            ):
+                raise SystemExit(
+                    "Refusing to overwrite submission weights; choose a different --weights-tag"
+                )
             np.savez_compressed(seq_npz_path, **final_params)
 
             best_s = max([s1, s2, s3, s4], key=lambda x: x["spell_f1"])
             new_weights = {
                 "kind": "ensemble",
                 "tree_model_file": "weights_trees.json",
-                "seq_model_file": "weights_seq.npz",
+                "seq_model_file": seq_name,
                 "team_variant": "duel_past",
                 "dead_variant": "stat",
                 "t_team": 1.0,
@@ -1220,15 +1278,22 @@ def main():
                 "costs": ens_costs_no if s3["spell_f1"] >= s4["spell_f1"] else ens_costs_dg,
                 "held_out_spell_f1": float(best_s["spell_f1"]),
                 "trained_on": (
-                    "metrica-sports/sample-data games 1-3 + IDSSE open Bundesliga matches (7 games) "
-                    "+ PFF FC FIFA World Cup 2022 open dataset, degraded"
+                    " + ".join(data_bits)
+                    + "; GBDT duel_past + MS-TCN 102ch ensemble"
+                    + (" (EXPERIMENTAL PFF variant — not the default submission)" if pff_rows else "")
+                ),
+                "experimental": bool(pff_rows),
+                "pff_licence": (
+                    "pending organiser clarification — do not submit until authorised"
+                    if pff_rows else None
                 ),
             }
-            with open(model.WEIGHTS, "w") as handle:
+            with open(json_path, "w") as handle:
                 json.dump(new_weights, handle, indent=1)
             print(
-                f"Wrote updated ensemble weights -> {os.path.relpath(model.WEIGHTS, ROOT)} "
-                f"and {os.path.relpath(seq_npz_path, ROOT)}",
+                f"Wrote ensemble weights -> {os.path.relpath(json_path, ROOT)} "
+                f"and {os.path.relpath(seq_npz_path, ROOT)}"
+                + (" (experimental; submission defaults untouched)" if args.weights_tag else ""),
                 flush=True,
             )
 

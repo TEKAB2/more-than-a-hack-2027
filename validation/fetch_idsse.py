@@ -32,7 +32,9 @@ import os
 import numpy as np
 
 MATCHES = ("J03WMX", "J03WN1", "J03WOH", "J03WOY", "J03WPY", "J03WQQ", "J03WR9")
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "external_data")
+OUT = os.environ.get("MTAH_EXTERNAL_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "external_data"
+)
 
 
 def convert(match_id, out_dir):
