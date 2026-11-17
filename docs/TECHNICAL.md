@@ -1,6 +1,6 @@
 ﻿# TercerHombre — More than a Hack 2027, Phase 1: technical note
 
-*Entry on branch `clean-trees`: GBDT (`duel_past`) + MS-TCN 102ch ensemble, simple Viterbi.
+*Entry on branch `clean-ensemble`: GBDT (`duel_past`) + MS-TCN 102ch ensemble, simple Viterbi.
 No PFF. External data only.*
 
 ## 1. Approach
@@ -59,7 +59,7 @@ Held-out spellF1 (10 games, leave-one-out, 2 degradation seeds), clean-trees sim
 | GBDT trees alone (`duel_past`) | 0.687 | 0.696 |
 | **GBDT + MS-TCN 102ch, simple Viterbi (this entry)** | **0.782** | **0.814** |
 
-## Compliance with the rules clarification of 16 November 2026 (branch `clean-trees`)
+## Compliance with the rules clarification of 16 November 2026 (branch `clean-ensemble`)
 
 * **Training and tuning use external data only**: Metrica public sample games (3) and the IDSSE
   open Bundesliga matches (7, CC BY 4.0). The PFF FC World Cup data is **not** used here.

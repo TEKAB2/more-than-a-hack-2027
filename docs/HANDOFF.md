@@ -1,68 +1,61 @@
-# Passation — état au lundi 16 novembre, 22 h 30 (heure de Québec)
+# Handoff — state on Tuesday 17 November 2026 (morning, Québec)
 
-**Date limite : mardi 17 novembre, 23 h 59 CET = 17 h 59 à Québec.** Le lien du formulaire de
-soumission n'a pas encore été reçu (il arrive à l'adresse d'inscription, pas sur Gmail) : il a été
-demandé aux organisateurs. Le formulaire est modifiable ; la dernière réponse compte.
+**Deadline: Tuesday 17 November 2026, 17:59 America/New_York (= 17:59 Québec).**  
+**Research freeze: 14:00 (same timezone).** The submission form is editable; the last response counts.
 
-## 1. Règles (courriel de clarification des organisateurs, prioritaire sur tout le reste)
+## 1. Rules clarification (organisers’ email — overrides older notes)
 
-Interdit :
-- vérifier nos sorties contre la vidéo (donc **ne plus utiliser `tools/viewer.html`**) ;
-- étiquettes ou données humaines sur le match fourni ;
-- envoyer les données fournies à un service d'IA (**aucun agent ne lit `data/` ni `cache/`**) ;
-- entraîner, ajuster ou calibrer sur la vérité terrain ou sur la vidéo fournie.
+Forbidden:
+- checking our outputs against the video (**do not use `tools/viewer.html` for verification**);
+- human labels or human-produced data on the provided match;
+- sending provided data to an AI service (**no agent reads `data/` or `cache/`**);
+- training, tuning or calibrating on the provided ground truth or video.
 
-Obligatoire : tout entraînement et tout réglage de paramètre se font **sur des données externes**.
-Permis : vérifications automatiques sur les données fournies ; tout jeu de données dont on a les
-droits (vérifier la licence).
+Required: all training and parameter choices use **external data only**.  
+Allowed: automatic checks on the provided data; any dataset we have rights to (verify the licence).
 
-Conséquences déjà tirées — **ne pas relancer** :
-- Fiche C (détecteur de ballon entraîné sur la vidéo fournie) : interdite, et avait échoué (1,2 %).
-- Fiche H (auto-apprentissage sur le match fourni) : interdite.
-- Fiche E (ballon de la caméra télé) : permise mais gain mesuré trop faible (+1,5 point de ballon vu).
-- Les 5 minutes de vérité publique : vérification seulement, jamais pour choisir une version.
+## 2. Version to submit: branch `clean-ensemble`
 
-## 2. Version prête à soumettre : branche `clean-trees`
+- **Model:** GBDT (`duel_past`, possession-weighted) + MS-TCN 102ch ensemble, simple Viterbi. **No PFF.**
+- **Training:** Metrica (3 games) + IDSSE Bundesliga (7 games, CC BY 4.0). External-only simulator (typed stoppages).
+- **Files to declare:** `submissions/TercerHombre.csv`, `TercerHombre.md`, branch URL.
+- **Repository URL:** `https://github.com/TEKAB2/more-than-a-hack-2027/tree/clean-ensemble`.
 
-- Modèle : arbres boostés (variante `duel_past`, pondération par possession) + Viterbi.
-- Entraînement : Metrica (3 matchs) + IDSSE Bundesliga (7 matchs, CC BY 4.0). Pas de PFF.
-- Simulateur `validation/external.py` : constantes tirées de données externes uniquement ; arrêts
-  typés (ballon sorti / ballon resté sur le terrain).
-- Fichier : `submissions/TercerHombre.csv`, SHA-256 `BEF80E4797BAF6803FF2506E803320D4015DB98FED2381A27B898FD092D05F9B`
-  (régénéré deux fois à l'identique). Document : `TercerHombre.md`.
-- Dépôt à déclarer : `https://github.com/TEKAB2/more-than-a-hack-2027/tree/clean-trees`.
+Do **not** declare `clean-trees` — that freeze is superseded by this ensemble.
 
-## 3. Chiffres — ne jamais confondre les deux colonnes
+## 3. Numbers — never confuse the two columns
 
-| version | banc d'essai (10 autres matchs, matchs exclus) | vrai match, 5 min publiques (17 possessions, très bruité) |
+| version | held-out bench (10 other games) | public 5 min on the provided match (17 spells, very noisy) |
 |---|---|---|
-| baseline officielle | 0,26–0,28 | 0,243 sur le match complet |
-| v7 (arbres, ancien simulateur) | 0,683 | 0,565 |
-| ensemble 5 réseaux + PFF (`main`) | 0,775 **non fiable** (réseaux entraînés sur les matchs du banc) | 0,575 |
-| **clean-trees** | 0,674 | **0,594** |
+| official baseline | ~0.26–0.28 | 0.243 on the full match |
+| clean-trees (trees alone, older freeze) | ~0.674 | ~0.594 |
+| **clean-ensemble (GBDT + MS-TCN 102ch, this entry)** | **~0.782** | **~0.640** |
 
-Le banc surestime le vrai match d'environ 0,10. Défaut principal sur le vrai match : seulement
-34 % des images de ballon mort reconnues (le banc en annonce 94 % : il ne reproduit pas les vrais arrêts).
-Borne mesurée au banc : équipe parfaite → 0,953 ; ballon mort parfait → 0,711.
+The public 5-minute score is a **pipeline sanity check only** — never use it to choose between versions or tune a parameter.
 
-## 4. Pistes en cours (à mesurer au banc, en matchs exclus, avant toute adoption)
+## 4. Closed tracks — do not reopen
 
-1. **SkillCorner Open Data** (10 matchs, tracking tiré de la vidéo télé, possession par image) :
-   vérifier la licence des données ; l'utiliser tel quel, sans dégradation ; adopter seulement si
-   le score sur les 3 matchs Metrica (exclus) monte d'au moins 0,005.
-2. **Un réseau 102 canaux réentraîné sur le nouveau simulateur**, chaque pli sans le match testé,
-   un seul modèle en mémoire (la machine a manqué de mémoire avec tout chargé). Adopter si
-   arbres + réseau gagne au moins 0,01 sur arbres seuls (0,674).
-3. PFF : formulaire officiel rempli ; licence non explicite ; question posée aux organisateurs.
-   Sans réponse positive, ne pas soumettre de modèle entraîné sur PFF.
+| track | decision |
+|---|---|
+| SkillCorner Open Data | measured as extra training; **hurt** Metrica held-out (−0.033); rejected |
+| PFF | licence unclear; **out of submission** until organisers say yes |
+| Fiche E (broadcast ball) | measured gain too small |
+| Fiche C (train ball detector on BAR–ATH) | **forbidden**; PR #9 is off the submission path |
+| Viewer to verify outputs | **forbidden** since the clarification |
+| Audio whistle (local only) | controls **PASS** (83 peals, hit 66.3 % ≥ 60 %); aggregate effect too small (+2 stoppages, dead 43.7 %→44.0 %, possessions 291→292). **Not adopted by default** — optional `--whistle` only if ever committed. Code still local (Joy Boy); **do not commit** without agreement. Recommendation: ship `clean-ensemble` **without** whistle. |
 
-## 5. Avant de remplacer la soumission
+## 5. Checklist before submitting the form
 
-- pipeline lancé deux fois → même SHA-256 ; `evaluation/validate_submission.py` → Valid ;
-- `git status` : rien sous `data/`, `cache/`, `submissions/`, `validation/external_data/` ;
-- `TercerHombre.md` décrit exactement le modèle soumis et cite toutes les données utilisées ;
-- inférence en numpy pur, sans réseau ni pickle ; aucune constante mesurée sur le match fourni.
+1. Branch URL points at **`clean-ensemble`** (not `clean-trees`).
+2. Run the pipeline twice → identical SHA-256 of `submissions/TercerHombre.csv`.
+3. `python evaluation/validate_submission.py submissions/TercerHombre.csv` → Valid.
+4. `git status`: nothing under `data/`, `cache/`, `submissions/`, `validation/external_data/`, `.venv/`.
+5. `TercerHombre.md` matches the submitted model and cites every external dataset used.
+6. Inference is numpy-only (no network, no pickle); no constant fitted on the provided match.
+7. After 14:00 freeze: confirm whistle stays non-default unless a local surprise changes that call.
 
-## 6. Questions envoyées aux organisateurs (réponses attendues)
+## 6. What remains for Joy Boy
 
-Lien du formulaire ; droit d'utiliser PFF ; éligibilité malgré l'usage du visualiseur avant la clarification.
+- Fill / update the organisers’ **submission form** (CSV + technical note + branch URL).
+- Resubmit if the form link arrives late — last response wins.
+- Optional local whistle stays off the default path; no commit of `possession/whistle.py` without an explicit go-ahead.
