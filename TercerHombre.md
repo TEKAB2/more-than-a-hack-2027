@@ -1,6 +1,6 @@
-﻿# TercerHombre — More than a Hack 2027, Phase 1: technical note
+# TercerHombre — More than a Hack 2027, Phase 1: technical note
 
-*Entry on branch `clean-trees`: GBDT (`duel_past`) + MS-TCN 102ch ensemble, simple Viterbi.
+*Entry on branch `clean-ensemble`: GBDT (`duel_past`) + MS-TCN 102ch ensemble, simple Viterbi.
 No PFF. External data only.*
 
 ## 1. Approach
@@ -110,29 +110,29 @@ Held-out spellF1 (10 games, leave-one-out, 2 degradation seeds), clean-trees sim
    cache/seq_features_cleantrees_102/.
 2. **Tree/sequence mix coefficients** (w_tree_team=0.25, w_seq_team=0.75,
    w_tree_dead=0.30, w_seq_dead=0.70, scales 1.0/0.7) were **fixed in advance** in
-   alidation/train_seq.py (and ensemble.DEFAULT_ENSEMBLE); they were **not** selected by
+   `validation/train_seq.py` (and ensemble.DEFAULT_ENSEMBLE); they were **not** selected by
    comparing alternatives on this held-out bench. (Only the decode choice change_alpha=0
    vs DirGated was taken from the held-out comparison on this run.)
 
 Exact training / write command used (torch needed only for training):
 
-`ash
+```bash
 python -m validation.train_seq --samples ../sample-data --carrier \
   --train-seeds 2 --eval-seeds 2 --model-seeds 1 --steps 3000 --batch-size 4 \
   --cache-dir cache/seq_features_cleantrees_102 --reuse-checkpoints --write-weights
-`
+```
 
 (No --use-pff. LOO measurement used the same flags without --write-weights /
 --reuse-checkpoints.)
 
-`ash
+```bash
 pip install -r requirements.txt -r validation/requirements.txt
 git clone https://github.com/metrica-sports/sample-data ../sample-data
 python -m validation.fetch_idsse
 # optional: retrain LOO / write weights (command above)
 # submission (numpy only)
 python -m possession.pipeline --team TercerHombre
-`
+```
 
 Deterministic: the same inputs produce a byte-identical CSV.
 
