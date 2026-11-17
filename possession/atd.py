@@ -9,6 +9,10 @@ Output (all indexed by VIDEO frame = frame_id - 1):
     ball     float32 (n_frames, 2)            x_m, y_m
     ball_extra float32 (n_frames, k)          any extra ball channels (z, flags...), NaN if absent
     team     int8    (n_slots,)               0 = home, 1 = away
+
+When broadcast assets are present and ``fuse_broadcast=True`` (the default for the BAR-ATH
+pipeline), missing tactical ball observations are filled from the time-aligned broadcast ATD
+(see ``broadcast.align``). Bench games without a broadcast folder are unchanged.
 """
 
 import os
@@ -17,6 +21,10 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 HOME, AWAY = 0, 1
+
+# Provenance channel appended to ball_extra when broadcast fusion runs.
+# 0 = tactical observation, 1 = broadcast fill, NaN = still missing.
+BALL_PROVENANCE_CHANNEL = "broadcast_provenance"
 
 
 def team_of_each_track(meta_path):
@@ -98,21 +106,72 @@ def parse_raw(raw_path, n_frames, n_slots, pitch):
     return players, ball, ball_extra
 
 
-def load(meta_path, raw_path, n_frames, pitch, cache_path=None):
-    """Arrays above, read from the cache when it is newer than the raw file."""
+def _append_provenance(ball_extra, provenance):
+    """Append a single provenance column to ball_extra."""
+    n = provenance.shape[0]
+    if ball_extra is None or ball_extra.size == 0:
+        return provenance.reshape(n, 1)
+    if ball_extra.ndim == 1:
+        ball_extra = ball_extra.reshape(n, 1)
+    return np.concatenate([ball_extra, provenance.reshape(n, 1)], axis=1).astype(np.float32)
+
+
+def apply_broadcast_fusion(data, aligned, fps=25.0, max_speed_m_s=35.0):
+    """In-place-safe copy: fill NaN ball from aligned broadcast; append provenance column."""
+    from broadcast.align import fuse_ball
+
+    ball, prov = fuse_ball(
+        data["ball"], aligned["ball_xy"], fps=fps, max_speed_m_s=max_speed_m_s)
+    out = dict(data)
+    out["ball"] = ball
+    out["ball_extra"] = _append_provenance(data.get("ball_extra"), prov)
+    out["ball_provenance"] = prov
+    return out
+
+
+def _try_fuse_broadcast(data, game, data_dir, broadcast_cache, fps=25.0):
+    """Fuse when broadcast assets (or a precomputed aligned cache) exist; else return data."""
+    from broadcast.align import align_and_cache, default_cache_path, load_aligned
+
+    cache_path = broadcast_cache or default_cache_path(game)
+    try:
+        if os.path.isfile(cache_path):
+            aligned = load_aligned(cache_path)
+        else:
+            aligned = align_and_cache(
+                game=game, data_dir=data_dir, cache_path=cache_path,
+                tac_data=data, force=False)
+    except IOError:
+        return data
+    except Exception as exc:  # noqa: BLE001 -- fusion must never break the tactical path
+        print("note: broadcast fusion skipped ({})".format(exc))
+        return data
+    return apply_broadcast_fusion(data, aligned, fps=fps)
+
+
+def load(meta_path, raw_path, n_frames, pitch, cache_path=None,
+         data_dir=None, game=None, fuse_broadcast=False, broadcast_cache=None, fps=25.0):
+    """Arrays above, read from the cache when it is newer than the raw file.
+
+    ``fuse_broadcast`` is off by default so synthetic / bench callers stay bit-identical.
+    ``possession.pipeline`` turns it on for BAR-ATH when a broadcast folder is available.
+    The tactical ``cache_path`` npz is always the unfused parse -- fusion is applied in memory.
+    """
     if cache_path and os.path.exists(cache_path) and \
             os.path.getmtime(cache_path) >= os.path.getmtime(raw_path):
         data = np.load(cache_path)
         out = {key: data[key] for key in data.files}
         out["team"] = team_of_each_track(meta_path)  # cheap, and never stale
-        return out
+    else:
+        team = team_of_each_track(meta_path)
+        players, ball, ball_extra = parse_raw(raw_path, n_frames, len(team), pitch)
+        out = {"players": players, "ball": ball, "ball_extra": ball_extra, "team": team}
+        if cache_path:
+            folder = os.path.dirname(cache_path)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            np.savez(cache_path, **out)
 
-    team = team_of_each_track(meta_path)
-    players, ball, ball_extra = parse_raw(raw_path, n_frames, len(team), pitch)
-    out = {"players": players, "ball": ball, "ball_extra": ball_extra, "team": team}
-    if cache_path:
-        folder = os.path.dirname(cache_path)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        np.savez(cache_path, **out)
+    if fuse_broadcast and game is not None:
+        out = _try_fuse_broadcast(out, game, data_dir, broadcast_cache, fps=fps)
     return out

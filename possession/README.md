@@ -18,6 +18,9 @@ Runtime ≈ 1 min the first time (parses the 199,319-line ATD into `cache/`), se
 ## Method
 
 1. **Parse** the raw ATD (tactical source) into arrays in metres. `video_frame = frame_id - 1`.
+   When `data/broadcast/` is present, `broadcast.align` recovers a per-segment frame offset from
+   player positions, rejects replays, and fills tactical NaN ball from the TV track (kinematic
+   gate ~35 m/s). Absent broadcast assets → identical to the previous tactical-only path.
 2. **Features** per frame, computed inside each graded half only: ball interpolated over gaps
    ≤ 0.5 s, ball speed, nearest home/away player distance, players near the ball, ball outside
    the pitch, player activity relative to the half's median, team block advancement.
@@ -51,6 +54,9 @@ then (Python 3.11+, `pip install -r validation/requirements.txt`) `python -m val
 `python tests/synth.py <dir>` writes a synthetic match in the exact bundle formats, so the whole
 pipeline can be run and scored (`evaluation/run_evaluation.py --gt <dir>/synthetic_gt.csv`)
 without the licensed data. It is a smoke test of the code, not a measure of real performance.
+
+`python -m tests.test_broadcast_align` checks broadcast offset recovery, replay rejection and ball
+fusion on synthetic tracks (no `data/` needed).
 
 ## Data hygiene
 

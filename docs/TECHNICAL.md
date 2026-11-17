@@ -34,8 +34,8 @@ method is built around one idea: **decide possession as a hidden state, not fram
 |---|---|
 | tactical ATD | all features (player and ball positions, player speeds) |
 | Smart Tagging | set pieces → restarts; phase team as a weak prior |
-| homography, videos | not used by the pipeline; the video was watched to understand the data |
-| broadcast feed | not used (no alignment to the tactical timeline) |
+| tactical homography, videos | not used by the pipeline; the video was watched to understand the data |
+| broadcast ATD + broadcast homography | time-aligned onto the tactical timeline (`broadcast/align.py`); fills tactical NaN ball when the TV camera still sees it (replays / invalid homography rejected). Provenance flag in `ball_extra`. No-op when `data/broadcast/` is absent (bench games). |
 | ball speed channel of the ATD | not used: empty on ~89 % of frames; speed is derived from positions |
 
 ## 3. Training data
@@ -128,6 +128,10 @@ observable proxy used for *controlled* possession.
   is recovered. Re-inserting them from control episodes after decoding was tried and lowered
   spellF1 (more false possessions than recovered ones), so it is not used.
 * Dead balls after a foul with no tag rely on the stationary-ball and player-activity cues only.
+* Broadcast fusion only helps where the TV camera is on the live pitch (homography `valid==1`)
+  and the recovered player-alignment median is ≤ 2.5 m; replays and slow-motion are rejected.
+  After a local run, re-check in-play “ball seen” with `python -m possession.diagnose` (aggregates
+  only) and, if it rises materially, recalibrate `MISSING_ALIVE` on the bench before retraining.
 * TODO after freeze.
 
 ## 6. Reproduction

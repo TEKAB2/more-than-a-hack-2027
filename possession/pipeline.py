@@ -53,7 +53,11 @@ def infer(data_dir=None, game=GAME, params=None, costs=None, use_tagging=True,
     home, away = team_names(meta)
 
     cache = os.path.join(ROOT, "cache", "{}_atd.npz".format(game))
-    data = atd_io.load(meta, raw, n, pitch, cache_path=cache)
+    # Broadcast fusion fills tactical NaN ball when data/<broadcast>/ exists; no-op otherwise.
+    data = atd_io.load(
+        meta, raw, n, pitch, cache_path=cache,
+        data_dir=data_dir, game=game, fuse_broadcast=True,
+    )
     feats = features.compute(data, blocks, pitch)
 
     tag_prior, pieces, goals = None, [], []
