@@ -118,7 +118,16 @@ def build_index(
     }
 
 
-def save_index(index: Dict[str, np.ndarray], out_dir: str) -> str:
+def save_index(
+    index: Dict[str, np.ndarray],
+    out_dir: str,
+    *,
+    source_game: str = "unknown",
+    for_training: bool = False,
+) -> str:
+    """Persist index + metadata. Provided-match indexes are tagged not-for-training."""
+    from ballvision.policy import mark_index_meta_training_allowed
+
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, INDEX_NAME)
     np.savez_compressed(
@@ -139,6 +148,9 @@ def save_index(index: Dict[str, np.ndarray], out_dir: str) -> str:
         "image_size": [IMAGE_WIDTH, IMAGE_HEIGHT],
         "patch_size": PATCH_SIZE,
     }
+    meta = mark_index_meta_training_allowed(
+        meta, source_game=source_game, for_training=for_training
+    )
     with open(os.path.join(out_dir, "index_meta.json"), "w") as handle:
         json.dump(meta, handle, indent=2, sort_keys=True)
         handle.write("\n")

@@ -2,6 +2,9 @@
 # pipeline (numpy + pandas only). Use a dedicated .venv-vision — see docs and
 # the Project store note ballvision-fiche-c-local.md.
 #
+# Organizer rule: NEVER train on BAR-ATH provided video. Train external/synthetic
+# only; BAR-ATH video is inference input with frozen weights.
+#
 # Licenses: PyTorch (BSD-3), torchvision (BSD-3), OpenCV-python headless (Apache-2.0).
 # Do NOT install Ultralytics (AGPL-3.0) — incompatible with this public repo.
 #

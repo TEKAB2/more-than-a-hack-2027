@@ -1,10 +1,10 @@
-"""Auto-supervised ball detector (TrackNet-style) from ATD pseudo-labels.
+"""TrackNet-style ball detector helpers (optional fill for missing ATD ball).
 
-Pseudo-labels come only from the ATD ball projected through the provided
-homography — no human annotation. Training and inference must never dump
-frame-level pixels or positions into logs; only aggregate metrics.
+Organizer rule: do NOT train/fine-tune/calibrate on BAR-ATH video or on
+ATD-derived patches from that match. Train on external or synthetic data only.
+BAR-ATH video/ATD may be used as inference INPUT with frozen weights.
 
-Weights are optional: without them the ATD loader is a no-op for vision fill.
+See ``ballvision.policy`` and ``docs/TECHNICAL.md`` §2.1.
 """
 
 __version__ = "0.1.0"

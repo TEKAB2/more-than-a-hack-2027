@@ -228,6 +228,49 @@ def test_metres_to_norm():
     assert abs(out[0, 1] - 0.5) < 1e-6
 
 
+def test_policy_refuses_bar_ath_train():
+    from ballvision.policy import is_provided_game, refuse_train_on_provided_game
+
+    assert is_provided_game("BAR-ATH")
+    assert is_provided_game("bar-ath")
+    assert not is_provided_game("METRICA_SAMPLE_1")
+    try:
+        refuse_train_on_provided_game("BAR-ATH")
+        raised = False
+    except SystemExit as exc:
+        raised = True
+        assert "FORBIDDEN" in str(exc)
+    assert raised
+
+
+def test_cli_extract_bar_ath_forbidden():
+    from ballvision.__main__ import main
+    import io
+    from contextlib import redirect_stderr
+
+    try:
+        main(["extract", "--game", "BAR-ATH"])
+        ok = False
+    except SystemExit as exc:
+        ok = True
+        assert "FORBIDDEN" in str(exc) or (isinstance(exc.code, int) and exc.code != 0) or exc.code is None
+        # SystemExit(msg) has code == msg string
+        assert "FORBIDDEN" in str(exc)
+    assert ok
+
+
+def test_cli_train_requires_confirm_external():
+    from ballvision.__main__ import main
+
+    try:
+        main(["train", "--cache-dir", "/tmp/ballvision_empty_ext"])
+        ok = False
+    except SystemExit as exc:
+        ok = True
+        assert "confirm-external" in str(exc).lower() or "FORBIDDEN" in str(exc) or "Refusing" in str(exc)
+    assert ok
+
+
 def run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in tests:

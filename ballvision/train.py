@@ -227,7 +227,12 @@ def metres_error_from_px(median_px: float, metres_per_px: float = 0.05) -> float
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Train ballvision TrackNetUNet")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train ballvision TrackNetUNet on EXTERNAL or synthetic patches only. "
+            "Never on BAR-ATH video / ATD-derived patches (organizer rule)."
+        )
+    )
     parser.add_argument("--cache-dir", default=os.path.join(ROOT, "cache", DEFAULT_CACHE_DIRNAME))
     parser.add_argument("--out", default=None, help="weights path (default: cache/ballvision/tracknet_unet.pt)")
     parser.add_argument("--epochs", type=int, default=20)
@@ -238,6 +243,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--device", default=None)
     args = parser.parse_args(argv)
+
+    from ballvision.policy import refuse_train_cache_from_provided
+    refuse_train_cache_from_provided(args.cache_dir)
 
     train_dir = os.path.join(args.cache_dir, "patches", "train")
     val_dir = os.path.join(args.cache_dir, "patches", "val")

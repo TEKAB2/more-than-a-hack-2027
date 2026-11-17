@@ -1,4 +1,9 @@
-"""CLI: python -m ballvision {build-index|extract|train|infer|smoke}"""
+"""CLI: python -m ballvision {build-index|extract|train|infer|smoke}
+
+Organizer rule (email): NEVER train/fine-tune/calibrate on BAR-ATH video or
+ATD-derived patches from that match. BAR-ATH video/ATD may be used at inference
+only, with frozen weights trained on external or synthetic data.
+"""
 
 from __future__ import annotations
 
@@ -11,10 +16,8 @@ sys.path.insert(0, ROOT)
 
 
 def cmd_build_index(args):
-    import numpy as np
-    from games import GAME, GAMES, require, source_frames
-    from possession import atd as atd_io
-    from starter import load_homography
+    from games import GAME
+    from ballvision.policy import is_provided_game, refuse_train_on_provided_game
     from ballvision.pseudolabels import (
         build_index,
         cache_root,
@@ -23,6 +26,19 @@ def cmd_build_index(args):
     )
 
     game = args.game or GAME
+    # Building a *training* index from the provided match is forbidden.
+    if not args.inference_diagnostics:
+        refuse_train_on_provided_game(game)
+    elif is_provided_game(game):
+        print(
+            "WARNING: index for provided match tagged for_training=false "
+            "(inference diagnostics only; train will refuse this cache)."
+        )
+
+    from games import GAMES, require, source_frames
+    from possession import atd as atd_io
+    from starter import load_homography
+
     meta, raw = require(["atd_meta", "atd_raw"], game, args.data_dir)[:2]
     n = source_frames("tactical", game)
     pitch = GAMES[game]["pitch"]
@@ -31,7 +47,12 @@ def cmd_build_index(args):
     matrices, _, valid = load_homography.load(game=game, data_dir=args.data_dir)
     index = build_index(data["ball"], matrices, valid, pitch=pitch, seed=args.seed)
     out_dir = args.cache_dir or cache_root(ROOT)
-    save_index(index, out_dir)
+    save_index(
+        index,
+        out_dir,
+        source_game=game,
+        for_training=not is_provided_game(game),
+    )
     summary = summarise_index(index)
     print("index -> {}".format(out_dir))
     print("  usable={n_usable:.0f}/{n_frames:.0f} ({usable_rate:.1%})  "
@@ -39,12 +60,20 @@ def cmd_build_index(args):
 
 
 def cmd_extract(args):
-    from games import GAME, require
-    from ballvision.frames import open_video
+    from games import GAME
+    from ballvision.policy import is_provided_game, refuse_train_on_provided_game
     from ballvision.pseudolabels import cache_root, load_index, write_patch_dataset
     from ballvision.constants import IMAGE_HEIGHT, IMAGE_WIDTH
 
     game = args.game or GAME
+    # Extracting training patches from the provided video is forbidden.
+    refuse_train_on_provided_game(game)
+    if is_provided_game(game):
+        return  # unreachable; refuse exits
+
+    from games import require
+    from ballvision.frames import open_video
+
     video = require(["video"], game, args.data_dir)[0]
     out_dir = args.cache_dir or cache_root(ROOT)
     index = load_index(out_dir)
@@ -65,10 +94,19 @@ def cmd_extract(args):
 
 
 def cmd_train(args):
+    from ballvision.constants import DEFAULT_CACHE_DIRNAME
+    from ballvision.policy import refuse_train_cache_from_provided
     from ballvision.train import main as train_main
-    argv = []
-    if args.cache_dir:
-        argv += ["--cache-dir", args.cache_dir]
+
+    cache_dir = args.cache_dir or os.path.join(ROOT, "cache", DEFAULT_CACHE_DIRNAME)
+    refuse_train_cache_from_provided(cache_dir)
+    if not args.confirm_external:
+        raise SystemExit(
+            "Refusing to train: pass --confirm-external to assert this cache was "
+            "built from EXTERNAL (or synthetic) data only — never BAR-ATH video/ATD patches. "
+            "See ballvision/policy.py."
+        )
+    argv = ["--cache-dir", cache_dir]
     if args.out:
         argv += ["--out", args.out]
     argv += ["--epochs", str(args.epochs), "--batch-size", str(args.batch_size),
@@ -81,6 +119,7 @@ def cmd_train(args):
 
 
 def cmd_infer(args):
+    """Inference on BAR-ATH is ALLOWED (video/ATD as input) with frozen weights."""
     from ballvision.infer import main as infer_main
     argv = []
     if args.game:
@@ -95,19 +134,21 @@ def cmd_infer(args):
         argv += ["--max-frames", str(args.max_frames)]
     if args.write_cache:
         argv.append("--write-cache")
+    print(
+        "ballvision infer: BAR-ATH video/ATD used as INPUT only; "
+        "weights must be frozen (trained externally or synthetic)."
+    )
     return infer_main(argv)
 
 
 def cmd_smoke(args):
-    """Synthetic end-to-end without real video (aggregate prints only)."""
+    """Synthetic end-to-end without real mp4 (aggregate prints only)."""
     import numpy as np
     import torch
     from ballvision.constants import IMAGE_HEIGHT, IMAGE_WIDTH, PATCH_SIZE, SEED
     from ballvision.frames import SyntheticFrameSource
     from ballvision.model import TrackNetUNet, heatmap_presence_loss, save_checkpoint
     from ballvision.pseudolabels import (
-        build_index,
-        extract_triplet_sample,
         project_ball_pixels,
         temporal_train_val_split,
         write_patch_dataset,
@@ -119,17 +160,14 @@ def cmd_smoke(args):
     set_seed(SEED)
     n = 120
     pitch = (105.0, 68.0)
-    # Fake identity-ish homography: norm -> pixels roughly linear.
     H = np.array([[IMAGE_WIDTH, 0, 0], [0, IMAGE_HEIGHT, 0], [0, 0, 1]], dtype=np.float64)
     matrices = np.broadcast_to(H, (n, 3, 3)).copy()
     valid = np.ones(n, dtype=bool)
-    # Ball path in metres.
     t = np.arange(n, dtype=np.float64)
     ball = np.column_stack([
         20 + 40 * (t / n),
         34 + 10 * np.sin(2 * np.pi * t / 40),
     ]).astype(np.float32)
-    # Punch holes for "missing" frames.
     missing = (t % 17 == 0) & (t > 10)
     ball_obs = ball.copy()
     ball_obs[missing] = np.nan
@@ -139,7 +177,6 @@ def cmd_smoke(args):
     print("smoke usable={} train={} val={}".format(
         int(usable.sum()), len(train_idx), len(val_idx)))
 
-    # Pixel positions for the synthetic renderer (full trajectory).
     pix_full = np.full((n, 2), np.nan)
     for i in range(n):
         nx, ny = ball[i, 0] / pitch[0], ball[i, 1] / pitch[1]
@@ -206,7 +243,6 @@ def cmd_smoke(args):
     )
     after = float(np.isfinite(filled["ball"][:, 0]).mean())
     print("smoke ball_seen  before={:.3f}  after={:.3f}".format(before, after))
-    # Determinism: second fill from cache must match.
     filled2 = fill_missing_ball(
         data,
         matrices=matrices,
@@ -220,21 +256,38 @@ def cmd_smoke(args):
     assert np.array_equal(
         np.nan_to_num(filled["ball"]), np.nan_to_num(filled2["ball"])
     )
-    print("smoke OK (deterministic fill cache)")
+    print("smoke OK (deterministic fill cache; synthetic train only)")
     return 0
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="python -m ballvision")
+    parser = argparse.ArgumentParser(
+        prog="python -m ballvision",
+        description=(
+            "Ball detector helpers. Train ONLY on external/synthetic data. "
+            "BAR-ATH video is inference input only."
+        ),
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("build-index", help="ATD→pixel index + train/val split")
+    p = sub.add_parser(
+        "build-index",
+        help="ATD→pixel index (FORBIDDEN on BAR-ATH unless --inference-diagnostics)",
+    )
     p.add_argument("--game", default=None)
     p.add_argument("--data-dir", default=None)
     p.add_argument("--cache-dir", default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--inference-diagnostics",
+        action="store_true",
+        help="allow indexing the provided match but tag for_training=false",
+    )
 
-    p = sub.add_parser("extract", help="Write patch .npz under cache/ballvision/")
+    p = sub.add_parser(
+        "extract",
+        help="Write training patches (FORBIDDEN on BAR-ATH provided video)",
+    )
     p.add_argument("--game", default=None)
     p.add_argument("--data-dir", default=None)
     p.add_argument("--cache-dir", default=None)
@@ -243,7 +296,10 @@ def main(argv=None):
     p.add_argument("--neg-ratio", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=42)
 
-    p = sub.add_parser("train", help="Train TrackNetUNet (local GPU)")
+    p = sub.add_parser(
+        "train",
+        help="Train TrackNetUNet on EXTERNAL/synthetic cache only",
+    )
     p.add_argument("--cache-dir", default=None)
     p.add_argument("--out", default=None)
     p.add_argument("--epochs", type=int, default=20)
@@ -251,8 +307,16 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--device", default=None)
+    p.add_argument(
+        "--confirm-external",
+        action="store_true",
+        help="required: assert cache is external/synthetic, not BAR-ATH",
+    )
 
-    p = sub.add_parser("infer", help="Fill missing ATD ball from video")
+    p = sub.add_parser(
+        "infer",
+        help="Fill missing ATD ball on BAR-ATH (ALLOWED; frozen weights)",
+    )
     p.add_argument("--game", default=None)
     p.add_argument("--data-dir", default=None)
     p.add_argument("--weights", default=None)
