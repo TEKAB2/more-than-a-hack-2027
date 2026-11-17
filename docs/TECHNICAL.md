@@ -138,8 +138,10 @@ Deterministic: the same inputs produce a byte-identical CSV.
 
 ## Explored, not used in this entry
 
-* **PFF FC FIFA World Cup 2022** — available via `validation/fetch_pff.py`; **not** used (licence
-  clarification pending; Compliance).
+* **PFF FC FIFA World Cup 2022** — available via `validation/fetch_pff.py`; **not** used in this
+  entry (licence clarification pending; Compliance). An experimental measurement branch /
+  protocol is documented in `docs/PFF_VARIANT.md` (`validation/measure_pff_gap.sh`); it must not
+  replace the default submission until organisers authorise PFF.
 * **SkillCorner Open Data** (10 A-League broadcast matches, MIT) — measured as extra training
   without degrade; **hurt** Metrica held-out (−0.033); not adopted.
 * **DirGated + KinSnap decode** — measured beside simple Viterbi; slightly worse held-out for the
