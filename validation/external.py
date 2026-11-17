@@ -251,21 +251,55 @@ def labels_from_events(events, n_frames, blocks):
 
 
 # --------------------------------------------------------------------------------- degrading
-# Ball visibility of the ATD, split by state. Measured on BAR-ATH with `possession.diagnose`,
-# grouping frames by OUR OWN predicted labels (algorithmic pseudo-labels, no human label, no
-# ground truth): ball seen on ~87 % of in-play frames and ~27 % of dead-ball frames. Consistent
-# with the published overall figure (59.3 % of graded frames, DATA.md). The first version of this
-# simulator dropped the ball uniformly (41 % everywhere), which hid the strongest dead-ball cue.
-MISSING_ALIVE = 0.13
-MISSING_DEAD = 0.73
-BALL_NOISE = 0.08   # ball drift (m); 0.08 brings the touch rate in play near the ATD's (~65 vs ~43 per min)
+# Ball visibility in the simulator. Every constant below comes from EXTERNAL data or from figures
+# the organisers publish -- none is measured on the provided game (rules clarification of
+# 16 Nov 2026: train and tune on external data only).
+#
+# * In play: Metrica's own public sample games lose the ball on 7-13 % of in-play frames (mean
+#   9.6 %), in gaps of mean 4.5 s (measured by validation/external.py on the three sample games).
+# * Stoppages are of two kinds, decided per stoppage from the external game itself:
+#     "out"      the ball left the pitch (event BALL OUT / shot out / goal on the Metrica games;
+#                ball position beyond a line on the DFL games): off camera, almost never tracked
+#                (Metrica samples: 92-100 % missing during dead balls);
+#     "on pitch" foul / free kick, the ball stays on the grass in view: tracked as often as in play.
+#   Without this split the dead-ball model learns "ball missing = dead" and misses every stoppage
+#   where the ball stays visible.
+# * Sanity check only (not a fit): DATA.md publishes 59.3 % of graded frames with a ball.
+MISSING_ALIVE = 0.10
+MISSING_DEAD_OUT = 0.95
+MISSING_DEAD_ONPITCH = 0.10
+MISSING_DEAD = MISSING_DEAD_OUT          # kept for callers that pass no stoppage types
+BALL_NOISE = 0.10                        # ball position error (m), a priori
+ALIVE_GAP_MIN = 1
+ALIVE_GAP_MEAN = int(4.5 * FPS)
 
 
-# Gap structure of the ATD (measured on BAR-ATH from aggregates only, 168 gaps): gaps are LONG
-# (median 9.6 s, p10 0.9 s) and short losses are almost absent -- the ATD bridges them itself.
-# So in play the ball vanishes rarely but for seconds at a time, not in frequent short bursts.
-ALIVE_GAP_MIN = 1 * FPS
-ALIVE_GAP_MEAN = 5 * FPS
+def stoppage_types(labels, events=None, ball=None, pitch=PITCH):
+    """Boolean array, True on dead-ball frames of an "on pitch" stoppage (ball stays in view).
+
+    Metrica games (events given, no ball during stoppages): on pitch when the stoppage starts with
+    a FAULT RECEIVED. Games with a ball position during stoppages (DFL): on pitch when the ball
+    never goes beyond a line during the stoppage.
+    """
+    n = len(labels)
+    onpitch = np.zeros(n, dtype=bool)
+    dead = labels == "D"
+    edges = np.diff(np.concatenate(([0], dead.astype(np.int8), [0])))
+    fouls = None
+    if events is not None and any(e["type"] == "FAULT RECEIVED" for e in events):
+        fouls = np.array(sorted(e["start"] for e in events if e["type"] == "FAULT RECEIVED"))
+    for a, b in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+        if fouls is not None:
+            k = np.searchsorted(fouls, a - 12)
+            onpitch[a:b] = k < len(fouls) and fouls[k] <= a + 12
+        elif ball is not None:
+            x, y = ball[a:b, 0], ball[a:b, 1]
+            ok = ~np.isnan(x)
+            if ok.mean() < 0.5:
+                continue
+            out = (x[ok] < 0) | (x[ok] > pitch[0]) | (y[ok] < 0) | (y[ok] > pitch[1])
+            onpitch[a:b] = not out.any()
+    return onpitch
 
 
 def _dropouts(mask, target, mean_burst, risk, seed, min_burst=1):
@@ -302,7 +336,7 @@ def _dropouts(mask, target, mean_burst, risk, seed, min_burst=1):
 
 
 def degrade(players, ball, rng, labels=None, track_missing=0.07, noise=0.25,
-            ball_noise=None):
+            ball_noise=None, onpitch=None):
     """Make clean tracking look like the automatic ATD.
 
     The ball goes missing in bursts, at the ATD's own rates for in-play and dead-ball frames
@@ -329,7 +363,12 @@ def degrade(players, ball, rng, labels=None, track_missing=0.07, noise=0.25,
         dead = labels == "D"
     seed = int(rng.integers(1 << 30))
     lost = _dropouts(alive, MISSING_ALIVE, ALIVE_GAP_MEAN, risk, seed, ALIVE_GAP_MIN)
-    lost |= _dropouts(dead, MISSING_DEAD, 5 * FPS, np.ones(n), seed + 1)
+    if onpitch is None:
+        lost |= _dropouts(dead, MISSING_DEAD, 5 * FPS, np.ones(n), seed + 1)
+    else:
+        lost |= _dropouts(dead & ~onpitch, MISSING_DEAD_OUT, 5 * FPS, np.ones(n), seed + 1)
+        lost |= _dropouts(dead & onpitch, MISSING_DEAD_ONPITCH, ALIVE_GAP_MEAN, np.ones(n),
+                          seed + 2, ALIVE_GAP_MIN)
     ball[lost] = np.nan
 
     n_slots = players.shape[1]
@@ -433,7 +472,8 @@ def prepare(samples_dir, seed=0, idsse_dir=IDSSE_DIR):
         if labels is None:
             labels = labels_from_events(events, len(ball), blocks)
         mark_openings(events, blocks)
-        players, ball = degrade(players, ball, rng, labels)
+        onpitch = stoppage_types(labels, events, ball)
+        players, ball = degrade(players, ball, rng, labels, onpitch=onpitch)
         atd = {"players": speeds(players), "ball": ball, "team": team}
         out.append((name, atd, blocks, labels, events))
     return out

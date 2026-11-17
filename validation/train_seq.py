@@ -354,7 +354,8 @@ def build_pff_rows(pff_dir=E.IDSSE_DIR, seeds=(0, 1), cache_dir=None, max_games=
                 with np.load(cache_file) as z:
                     X = z["X"].astype(np.float32)
             else:
-                players_deg, ball_deg = E.degrade(players, ball, rng, labels)
+                players_deg, ball_deg = E.degrade(players, ball, rng, labels,
+                                                  onpitch=E.stoppage_types(labels, None, ball))
                 atd = {"players": E.speeds(players_deg), "ball": ball_deg, "team": team}
                 f = features.compute(atd, blocks, E.PITCH)
                 ev = emissions.ball_team_evidence(f, emissions.PARAMS) / emissions.PARAMS["w_ball"]

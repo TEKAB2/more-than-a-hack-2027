@@ -110,6 +110,28 @@ ELASTIC, Kim et al., 2025): a local peak of the ball's acceleration (≥ 10 m/s�
 of direction (≥ 25°) while a player is within 2 m. "Two touches in a row by one team" is the
 observable proxy used for *controlled* possession.
 
+## Compliance with the rules clarification of 16 November 2026 (branch `clean-trees`)
+
+This branch is the conservative entry: gradient-boosted trees + Viterbi only.
+
+* **Training and tuning use external data only**: Metrica public sample games (3) and the IDSSE
+  open Bundesliga matches (7, CC BY 4.0). The PFF FC World Cup data is **not** used here.
+* **No constant is measured on the provided game.** The tracking simulator
+  (`validation/external.py`) takes its ball-visibility rates from Metrica's own public sample
+  games (ball lost on 7-13 % of in-play frames, gaps of mean 4.5 s; 92-100 % lost when the ball is
+  out of play). Stoppages are typed from the external game itself: *ball out* (off camera) or
+  *on pitch* (foul / free kick, ball still in view). The figure published in DATA.md (59.3 % of
+  graded frames with a ball) is used as a sanity check only: the simulator gives 68 %.
+* Effect of the typed stoppages, measured on the external bench (10 games, leave-one-game-out):
+  stoppages where the ball stays in view found 94 % of the time, against 33 % for the previous
+  model, which had learnt "ball missing = dead ball"; spellF1 0.674 (previous model 0.670).
+* Nothing is trained, fitted or calibrated on the ground-truth possession data or on the provided
+  video. The public 5-minute ground truth is read by `possession/diagnose.py` and by the official
+  scorer only, as an automatic check.
+* Before the clarification, the team used a local viewer (`tools/viewer.html`) to understand what
+  counts as possession. No label, correction or frame-specific constant was derived from it, and
+  it has not been used to check outputs since.
+
 ## 4. Possession rules implemented
 
 * Loose or contested ball: possession stays with the last team (no evidence → no switch).
