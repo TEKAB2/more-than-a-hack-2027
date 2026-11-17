@@ -44,7 +44,7 @@ def summarise(labels, blocks):
 
 
 def infer(data_dir=None, game=GAME, params=None, costs=None, use_tagging=True,
-          weights_path=None, verbose=True):
+          weights_path=None, verbose=True, ballvision=False, ballvision_cfg=None):
     """Everything up to the labels, nothing written. Returns a dict (also used by tools/)."""
     meta, raw, tags_path = require(["atd_meta", "atd_raw", "smart_tagging"], game, data_dir)
     n = source_frames("tactical", game)
@@ -53,7 +53,33 @@ def infer(data_dir=None, game=GAME, params=None, costs=None, use_tagging=True,
     home, away = team_names(meta)
 
     cache = os.path.join(ROOT, "cache", "{}_atd.npz".format(game))
-    data = atd_io.load(meta, raw, n, pitch, cache_path=cache)
+    bv_cfg = dict(ballvision_cfg or {})
+    if ballvision and "pitch" not in bv_cfg:
+        bv_cfg["pitch"] = pitch
+    if ballvision and "blocks" not in bv_cfg:
+        bv_cfg["blocks"] = blocks
+    if ballvision and "repo_root" not in bv_cfg:
+        bv_cfg["repo_root"] = ROOT
+    if ballvision and "video_path" not in bv_cfg:
+        try:
+            bv_cfg["video_path"] = require(["video"], game, data_dir)[0]
+        except Exception:
+            pass
+    if ballvision and ("matrices" not in bv_cfg or "valid" not in bv_cfg):
+        try:
+            from starter import load_homography
+            matrices, _, valid = load_homography.load(game=game, data_dir=data_dir)
+            bv_cfg.setdefault("matrices", matrices)
+            bv_cfg.setdefault("valid", valid)
+        except Exception as exc:
+            if verbose:
+                print("ballvision: homography unavailable ({})".format(exc))
+    if ballvision and "cache_path" not in bv_cfg:
+        bv_cfg["cache_path"] = os.path.join(
+            ROOT, "cache", "ballvision", "fill_{}.npz".format(game)
+        )
+    data = atd_io.load(meta, raw, n, pitch, cache_path=cache,
+                       ballvision=ballvision, ballvision_cfg=bv_cfg if ballvision else None)
     feats = features.compute(data, blocks, pitch)
 
     tag_prior, pieces, goals = None, [], []
@@ -87,8 +113,9 @@ def infer(data_dir=None, game=GAME, params=None, costs=None, use_tagging=True,
 
 
 def run(team, data_dir=None, game=GAME, params=None, costs=None, use_tagging=True,
-        weights_path=None):
-    out = infer(data_dir, game, params, costs, use_tagging, weights_path)
+        weights_path=None, ballvision=False, ballvision_cfg=None):
+    out = infer(data_dir, game, params, costs, use_tagging, weights_path,
+                ballvision=ballvision, ballvision_cfg=ballvision_cfg)
     labels = out["labels"]
 
     out_dir = os.path.join(ROOT, "submissions")
@@ -115,11 +142,27 @@ def main():
     parser.add_argument("--check", action="store_true",
                         help="run the official validator, then score on the public window "
                              "(SANITY ONLY - never use it to choose between versions)")
+    parser.add_argument("--ballvision", action="store_true",
+                        help="apply cache/ballvision/fill_*.npz (numpy-only; no torch). "
+                             "Build the cache with: python -m ballvision infer --write-cache")
+    parser.add_argument("--ballvision-weights", default=None,
+                        help="optional weights path used only to verify fill-cache fingerprint")
+    parser.add_argument("--ballvision-detect", action="store_true",
+                        help="if fill cache missing, run the torch detector (local GPU only; "
+                             "not the default submission path)")
     args = parser.parse_args()
 
     weights_path = None if args.v1 or not os.path.exists(model.WEIGHTS) else model.WEIGHTS
+    bv_cfg = None
+    if args.ballvision:
+        bv_cfg = {"game": GAME}
+        if args.ballvision_weights:
+            bv_cfg["weights_path"] = args.ballvision_weights
+        if args.ballvision_detect:
+            bv_cfg["run_detector"] = True
     path = run(args.team, args.data_dir, use_tagging=not args.no_tagging,
-               weights_path=weights_path)
+               weights_path=weights_path, ballvision=args.ballvision,
+               ballvision_cfg=bv_cfg)
     if args.check:
         evaluation = os.path.join(ROOT, "evaluation")
         subprocess.call([sys.executable, os.path.join(evaluation, "validate_submission.py"), path])

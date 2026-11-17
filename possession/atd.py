@@ -98,21 +98,43 @@ def parse_raw(raw_path, n_frames, n_slots, pitch):
     return players, ball, ball_extra
 
 
-def load(meta_path, raw_path, n_frames, pitch, cache_path=None):
-    """Arrays above, read from the cache when it is newer than the raw file."""
+def load(meta_path, raw_path, n_frames, pitch, cache_path=None, ballvision=False,
+         ballvision_cfg=None):
+    """Arrays above, read from the cache when it is newer than the raw file.
+
+    ``ballvision=True`` optionally fills still-missing ball frames with the
+    TrackNet-style detector in ``ballvision/`` (pseudo-labels from ATD+H only).
+    Without weights or a usable cfg the call is a no-op. The raw ATD cache is
+    never rewritten with vision fills — those use a separate fill cache.
+    """
     if cache_path and os.path.exists(cache_path) and \
             os.path.getmtime(cache_path) >= os.path.getmtime(raw_path):
         data = np.load(cache_path)
         out = {key: data[key] for key in data.files}
         out["team"] = team_of_each_track(meta_path)  # cheap, and never stale
-        return out
+    else:
+        team = team_of_each_track(meta_path)
+        players, ball, ball_extra = parse_raw(raw_path, n_frames, len(team), pitch)
+        out = {"players": players, "ball": ball, "ball_extra": ball_extra, "team": team}
+        if cache_path:
+            folder = os.path.dirname(cache_path)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            # Persist raw ATD only (no vision fills).
+            raw_keys = ("players", "ball", "ball_extra", "team")
+            np.savez(cache_path, **{k: out[k] for k in raw_keys})
 
-    team = team_of_each_track(meta_path)
-    players, ball, ball_extra = parse_raw(raw_path, n_frames, len(team), pitch)
-    out = {"players": players, "ball": ball, "ball_extra": ball_extra, "team": team}
-    if cache_path:
-        folder = os.path.dirname(cache_path)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        np.savez(cache_path, **out)
+    if ballvision:
+        out = apply_ballvision_fill(out, ballvision_cfg or {})
     return out
+
+
+def apply_ballvision_fill(data, cfg=None):
+    """Delegate to ``ballvision.infer.apply_ballvision``; no-op if unavailable."""
+    cfg = cfg or {}
+    try:
+        from ballvision.infer import apply_ballvision
+    except ImportError as exc:
+        print("ballvision: import failed ({}) — skip".format(exc))
+        return data
+    return apply_ballvision(data, cfg)

@@ -59,6 +59,7 @@ organizers/
 __pycache__/
 *.py[cod]
 .venv/
+.venv-vision/
 venv/
 env/
 .DS_Store
@@ -66,5 +67,6 @@ env/
 # team pipeline
 cache/
 submissions/
+# ballvision weights / patches live under cache/ballvision/ (already covered by cache/)
 # open Bundesliga matches (CC BY 4.0, downloaded by validation/fetch_idsse.py)
 validation/external_data/

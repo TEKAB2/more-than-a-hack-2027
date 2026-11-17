@@ -34,9 +34,30 @@ method is built around one idea: **decide possession as a hidden state, not fram
 |---|---|
 | tactical ATD | all features (player and ball positions, player speeds) |
 | Smart Tagging | set pieces → restarts; phase team as a weak prior |
-| homography, videos | not used by the pipeline; the video was watched to understand the data |
-| broadcast feed | not used (no alignment to the tactical timeline) |
+| homography + tactical video | optional `ballvision/` fill for ATD ball gaps (see §2.1); off by default |
+| broadcast feed | not used by the default pipeline (no alignment to the tactical timeline) |
 | ball speed channel of the ATD | not used: empty on ~89 % of frames; speed is derived from positions |
+
+### 2.1 Optional ballvision fill (Fiche C)
+
+When the ATD loses the ball (~13 % of in-play frames), an optional TrackNet-style
+detector (`ballvision/`) can propose a position. It is **auto-supervised**: every
+training target is the ATD ball projected to pixels with the provided homography
+(`starter.load_homography.project`). No human label is used. Architecture: a
+compact 3-frame UNet (9-channel RGB stack → heatmap + presence), pure PyTorch,
+BSD/MIT stack only (no Ultralytics/AGPL). The detector runs only on still-missing
+frames (after any optional broadcast fusion), inside a search window from the
+kinematic prior / nearby players, maps the heatmap peak back with `unproject`,
+and rejects teleports (`MAX_BALL_SPEED_M_S`).
+
+**Submission path stays numpy + pandas.** Local GPU builds
+`cache/ballvision/fill_<game>.npz` via `python -m ballvision infer --write-cache`.
+`python -m possession.pipeline --ballvision` then loads that array with numpy only
+(no torch, no pickle). Without the fill cache the flag is a no-op. Torch weights
+(`.pt`) are a local training artefact / release asset to *regenerate* the fill
+cache, not a runtime dependency of the scored CSV. Cloud agents ship the code +
+synthetic tests; GPU training is local (RTX 4070) — see Project store
+`ballvision-fiche-c-local.md`.
 
 ## 3. Training data
 
@@ -142,3 +163,25 @@ python -m possession.pipeline --team TercerHombre
 ```
 
 Deterministic: the same inputs produce a byte-identical CSV.
+
+### 6.1 ballvision (optional, local GPU)
+
+```bash
+# dedicated env — see requirements-vision.txt header for CUDA index URL
+python3.12 -m venv .venv-vision && source .venv-vision/bin/activate
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements-vision.txt
+python -c "import torch; assert torch.cuda.is_available()"
+
+python -m ballvision build-index
+python -m ballvision extract --max-train 40000 --max-val 8000
+python -m ballvision train --epochs 20 --batch-size 8
+python -m ballvision infer --write-cache   # writes cache/ballvision/fill_*.npz
+python -m possession.diagnose              # aggregate ball-seen only
+# scored CSV: numpy load of the fill cache (no torch)
+python -m possession.pipeline --team TercerHombre --ballvision --check
+# two runs must share the same sha256 of submissions/TercerHombre.csv
+```
+
+Synthetic smoke (no gated data): `python -m ballvision smoke` and
+`python tests/test_ballvision.py`.

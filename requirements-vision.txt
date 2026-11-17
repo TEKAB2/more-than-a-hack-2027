@@ -1,0 +1,34 @@
+# Optional vision stack for ballvision/ (Fiche C). NOT required for the submission
+# pipeline (numpy + pandas only). Use a dedicated .venv-vision — see docs and
+# the Project store note ballvision-fiche-c-local.md.
+#
+# Licenses: PyTorch (BSD-3), torchvision (BSD-3), OpenCV-python headless (Apache-2.0).
+# Do NOT install Ultralytics (AGPL-3.0) — incompatible with this public repo.
+#
+# --- Windows / WSL2 + CUDA (Joy Boy RTX 4070) ---------------------------------
+# Prefer Python 3.12 if 3.13 has no CUDA wheel yet. Pick the exact torch index
+# from https://pytorch.org/get-started/locally/ — example (CUDA 12.4):
+#
+#   py -3.12 -m venv .venv-vision
+#   .venv-vision\Scripts\activate          # PowerShell: .\.venv-vision\Scripts\Activate.ps1
+#   # WSL:
+#   # python3.12 -m venv .venv-vision && source .venv-vision/bin/activate
+#
+#   pip install --upgrade pip
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements-vision.txt
+#   python -c "import torch; assert torch.cuda.is_available(), torch.__version__"
+#
+# CPU-only (CI / cloud smoke, no real video training):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements-vision.txt
+
+numpy>=1.23
+pandas>=1.5
+opencv-python-headless>=4.8
+tqdm>=4.66
+
+# torch / torchvision: install from the official index first (see header), then
+# leave these unpinned so pip does not overwrite a CUDA build with a CPU one.
+# torch
+# torchvision
