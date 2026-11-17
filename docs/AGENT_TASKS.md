@@ -180,3 +180,49 @@ petit (< 1 M de paramètres) : l'entraînement doit tenir en moins de 1 h sur la
 **Critère de réussite** : spellF1 du banc ≥ 0,72 (référence v7 : 0,683) et changements
 retrouvés à ±0,5 s ≥ 55 % (référence : 44 %). Échéance : vendredi midi, sinon on soumet la
 meilleure version déjà validée.
+
+---
+
+## H. Adapter le modèle au match du Barça par auto-apprentissage (gain attendu : élevé sur le vrai match)
+
+**Constat** : le banc d'essai annonce environ 0,68 à 0,78, mais le vrai match (5 minutes publiques)
+plafonne vers 0,57. Le modèle apprend sur d'autres matchs, avec un autre tracking et d'autres
+conventions d'étiquetage. Il n'a jamais appris sur le tracking du Barça lui-même.
+
+**Ce que le règlement permet** (RULES.md, « What remains fine on the provided game ») : « learning
+without human labels — unsupervised or self-supervised methods, or pseudo-labels produced by an
+algorithm, provided no person decided any of them ». On peut donc s'entraîner sur BAR-ATH avec
+des étiquettes produites **par notre modèle**, jamais par un humain.
+
+**Méthode (auto-apprentissage, en deux tours au maximum)** :
+1. Lancer le modèle actuel sur le match complet. Pour chaque image, garder H, A ou D et une
+   confiance : marge des probabilités, et distance au changement prédit le plus proche.
+2. Sélection **fixée à l'avance**, jamais réglée sur la vérité publique :
+   - images de possession à plus de 1,5 s de tout changement prédit, avec |P(H) − P(A)| ≥ 0,6 ;
+   - images d'arrêt avec P(mort) ≥ 0,9 ;
+   - aucune image à moins de 1,5 s d'un changement prédit : c'est là que le modèle se trompe le plus.
+3. Réentraîner les modèles d'émission sur le banc **plus** ces pseudo-étiquettes de BAR-ATH,
+   avec un poids fixé à l'avance (par exemple 0,5).
+4. Second tour facultatif, uniquement si le premier gagne au protocole de validation ci-dessous.
+
+**Validation honnête, au banc** : on simule exactement la même procédure sur chaque match du banc.
+Le match exclu joue le rôle de BAR-ATH : on le pseudo-étiquette avec le modèle entraîné sur les
+autres, on réentraîne, puis on note avec ses vraies étiquettes. L'auto-apprentissage n'est
+gardé que s'il fait mieux que sans, en moyenne sur les 10 matchs (2 graines) **et** sur les 3
+matchs Metrica.
+
+**Fichiers autorisés** : nouveau `validation/selftrain.py`, et `possession/pipeline.py` (une
+option pour charger les poids adaptés). Les seuils de sélection sont des constantes en tête de
+`selftrain.py`, avec un commentaire qui les justifie.
+
+**Règles spéciales** :
+- Les pseudo-étiquettes de BAR-ATH sont calculées et stockées dans `cache/` (jamais commité) ;
+  l'agent ne les lit pas et n'affiche que des agrégats (nombre d'images retenues par classe).
+- La vérité publique des 5 minutes ne sert à rien d'autre qu'à la vérification finale
+  (`--check`) ; elle ne choisit ni seuil, ni poids, ni tour.
+- Reproductibilité : le pipeline final doit régénérer le même fichier, octet pour octet.
+- Mémoire : un seul type de modèle chargé à la fois (la machine a 32 Go).
+
+**Critère de réussite** : gain au protocole de validation ci-dessus, puis, pour information,
+le spellF1 des 5 minutes publiques avec son intervalle (`run_evaluation.py --bootstrap 1000`).
+Échéance : dimanche midi.
