@@ -38,10 +38,12 @@ TIED = True  # to_dead == restart: halves nothing that matters, quarters the sea
 SUBSAMPLE = 4  # every 4th frame for fitting: neighbouring frames are near-duplicates
 
 
-def build(samples, seeds, team_variant, dead_variant):
+def build(samples, seeds, team_variant, dead_variant, include_skillcorner=False):
     rows = []
     for seed in seeds:
-        for name, atd, blocks, labels, events in E.prepare(samples, seed=seed):
+        # SkillCorner has no degrade randomness: attach once (below), not once per seed.
+        for name, atd, blocks, labels, events in E.prepare(
+                samples, seed=seed, include_skillcorner=False):
             f = features.compute(atd, blocks, E.PITCH)
             ev = emissions.ball_team_evidence(f, emissions.PARAMS) / emissions.PARAMS["w_ball"]
             rows.append({
@@ -49,6 +51,19 @@ def build(samples, seeds, team_variant, dead_variant):
                 "name": name, "seed": seed, "blocks": blocks, "labels": labels, "events": events,
                 "f": f, "Xd": model.dead_features(f, blocks, E.PITCH, dead_variant),
                 "Xt": model.team_features(f, blocks, E.PITCH, ev, team_variant),
+                "is_skillcorner": False,
+            })
+    if include_skillcorner:
+        # Load SkillCorner as-is once (broadcast gaps already present; no degrade).
+        for name, atd, blocks, labels, events in E.prepare_skillcorner():
+            f = features.compute(atd, blocks, E.PITCH)
+            ev = emissions.ball_team_evidence(f, emissions.PARAMS) / emissions.PARAMS["w_ball"]
+            rows.append({
+                "pieces": E.fake_set_piece_tags(events, np.random.default_rng(100)),
+                "name": name, "seed": 0, "blocks": blocks, "labels": labels, "events": events,
+                "f": f, "Xd": model.dead_features(f, blocks, E.PITCH, dead_variant),
+                "Xt": model.team_features(f, blocks, E.PITCH, ev, team_variant),
+                "is_skillcorner": True,
             })
     return rows
 
@@ -221,6 +236,9 @@ def main():
                         help="team temperatures searched by --mini-grid (comma-separated)")
     parser.add_argument("--no-spell-weight", action="store_true",
                         help="fit the team model without the per-possession frame weights")
+    parser.add_argument("--skillcorner", action="store_true",
+                        help="add SkillCorner Open Data (skillcorner_*.npz) to every training "
+                             "fold only; never held out for scoring (broadcast tracking, no degrade)")
     args = parser.parse_args()
     if not args.samples:
         parser.error("--samples is required (or set the MTAH_SAMPLES environment variable)")
@@ -238,8 +256,10 @@ def main():
     LEARNER = args.learner
     SPELL_WEIGHT = not args.no_spell_weight
 
-    rows = build(args.samples, tuple(range(args.seeds)), args.team_variant, args.dead_variant)
-    names = sorted({r["name"] for r in rows})
+    rows = build(args.samples, tuple(range(args.seeds)), args.team_variant, args.dead_variant,
+                 include_skillcorner=args.skillcorner)
+    # Score only on Metrica + DFL held-out folds; SkillCorner stays training-only.
+    names = sorted({r["name"] for r in rows if not r.get("is_skillcorner")})
     combos = [c for c in itertools.product(*GRID.values()) if not TIED or c[1] == c[2]]
     held = {c: [] for c in combos}
     timings = {}
@@ -295,12 +315,17 @@ def main():
         return
 
     weights = fit(rows)
+    trained_on = ("metrica-sports/sample-data games 1-3 + IDSSE open Bundesliga "
+                  "matches (validation/external_data), degraded")
+    if args.skillcorner:
+        n_sc = len({r["name"] for r in rows if r.get("is_skillcorner")})
+        trained_on += (" + SkillCorner Open Data ({} A-League 2024/25 matches, MIT, "
+                       "broadcast tracking as-is, no degrade)".format(n_sc))
     weights.update(t_team=best["t_team"], t_dead=best["t_dead"],
                    team_variant=args.team_variant, dead_variant=args.dead_variant,
                    costs={k: best[k] for k in ("switch", "to_dead", "restart")},
                    held_out_spell_f1=float(np.mean(held[ranked[0]])),
-                   trained_on="metrica-sports/sample-data games 1-3 + IDSSE open Bundesliga "
-                              "matches (validation/external_data), degraded")
+                   trained_on=trained_on)
     if LEARNER == "gbdt":
         model_file = os.path.splitext(os.path.basename(args.out))[0] + "_trees.json"
         with open(os.path.join(os.path.dirname(os.path.abspath(args.out)), model_file), "w") as h:
@@ -312,8 +337,9 @@ def main():
     if LEARNER == "gbdt":
         weights = model.load_weights(args.out)
     print("final, in-sample:")
-    for (name, seed), s in zip([(r["name"], r["seed"]) for r in rows],
-                               evaluate(rows, weights, weights["costs"])):
+    bench_rows = [r for r in rows if not r.get("is_skillcorner")]
+    for (name, seed), s in zip([(r["name"], r["seed"]) for r in bench_rows],
+                               evaluate(bench_rows, weights, weights["costs"])):
         print("  {} seed{}  spellF1 {:.4f} macroF1 {:.4f}  poss gt {} pred {}  "
               "delay team {:+.2f}s restart {:+.2f}s  short-poss recall {:.2f}".format(
                   name, seed, *s))

@@ -223,6 +223,17 @@ def load_idsse(path, merge_s=None):
     return (players, ball.astype(np.float32)), z["team"].astype(np.int8), blocks, labels, events
 
 
+def load_skillcorner(path, merge_s=None):
+    """One SkillCorner Open Data match saved by validation.fetch_skillcorner.
+
+    Broadcast tracking is already automatic and incomplete (`is_detected`); do NOT pass it through
+    `degrade()`. Labels: dead outside Phases of Play; H/A from `possession.group` with last-team
+    hold while alive and the group is empty (see fetch_skillcorner docstring). Same return shape
+    as `load_idsse`.
+    """
+    return load_idsse(path, merge_s=merge_s)
+
+
 # ------------------------------------------------------------------------------------ labels
 def labels_from_events(events, n_frames, blocks):
     labels = np.full(n_frames, "X", dtype="<U1")
@@ -446,19 +457,46 @@ IDSSE_DIR = os.environ.get("MTAH_EXTERNAL_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "external_data")
 
 
-def prepare(samples_dir, seed=0, idsse_dir=IDSSE_DIR):
+def prepare_skillcorner(idsse_dir=None):
+    """SkillCorner Open Data only, as-is (no degrade). Used as extra training material."""
+    idsse_dir = IDSSE_DIR if idsse_dir is None else idsse_dir
+    out = []
+    if not idsse_dir or not os.path.isdir(idsse_dir):
+        return out
+    for name in sorted(os.listdir(idsse_dir)):
+        if not (name.startswith("skillcorner_") and name.endswith(".npz")):
+            continue
+        (players, ball), team, blocks, labels, events = load_skillcorner(
+            os.path.join(idsse_dir, name))
+        mark_openings(events, blocks)
+        atd = {"players": speeds(players), "ball": ball, "team": team}
+        out.append((name[:-4], atd, blocks, labels, events))
+    return out
+
+
+def prepare(samples_dir, seed=0, idsse_dir=IDSSE_DIR, include_skillcorner=False):
     """[(name, atd_dict, blocks, labels, events)] for the sample games (+ the open Bundesliga
-    matches when validation/external_data holds them), degraded like the ATD."""
+    matches when validation/external_data holds them), degraded like the ATD.
+
+    SkillCorner Open Data (`skillcorner_*.npz`) is optional training-only material: already
+    automatic broadcast tracking, so it is loaded as-is (no `degrade`) when
+    `include_skillcorner=True`.
+    """
     rng = np.random.default_rng(seed)
     data_dir = os.path.join(samples_dir, "data")
     games = []
     extra = []
+    skillcorner = []
     if idsse_dir and os.path.isdir(idsse_dir):
         for name in sorted(os.listdir(idsse_dir)):
             if name.startswith("idsse_") and name.endswith(".npz"):
                 (players, ball), team, blocks, labels, events = load_idsse(
                     os.path.join(idsse_dir, name))
                 extra.append((name[:-4], players, ball, team, blocks, events, labels))
+            elif include_skillcorner and name.startswith("skillcorner_") and name.endswith(".npz"):
+                (players, ball), team, blocks, labels, events = load_skillcorner(
+                    os.path.join(idsse_dir, name))
+                skillcorner.append((name[:-4], players, ball, team, blocks, events, labels))
     for n in (1, 2):
         (players, ball), team, blocks, events = load_csv_game(
             os.path.join(data_dir, "Sample_Game_{}".format(n)), n)
@@ -474,6 +512,11 @@ def prepare(samples_dir, seed=0, idsse_dir=IDSSE_DIR):
         mark_openings(events, blocks)
         onpitch = stoppage_types(labels, events, ball)
         players, ball = degrade(players, ball, rng, labels, onpitch=onpitch)
+        atd = {"players": speeds(players), "ball": ball, "team": team}
+        out.append((name, atd, blocks, labels, events))
+    # SkillCorner: keep broadcast gaps as published (no degrade).
+    for name, players, ball, team, blocks, events, labels in skillcorner:
+        mark_openings(events, blocks)
         atd = {"players": speeds(players), "ball": ball, "team": team}
         out.append((name, atd, blocks, labels, events))
     return out
